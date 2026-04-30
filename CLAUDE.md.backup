@@ -1,0 +1,2688 @@
+# Hify — CLAUDE.md
+
+## 项目概述
+
+### 产品定位
+
+Hify 是一个面向团队内部的简化版 AI Agent 平台，灵感来源于 Dify。支持构建对话助手、智能代理和自动化工作流，提供 RAG 知识库检索和工具集成能力。一人开发，20-50 人使用，Docker + Kubernetes 部署。
+
+### 做什么（V1 MVP）
+
+- **三种应用类型**：Chatbot（对话助手）、Agent（智能代理）、Workflow（自动化工作流）
+- **工作流引擎**：7 个核心节点 — LLM、知识检索、HTTP 请求、代码执行、条件分支、模板、变量赋值
+- **RAG 知识库**：向量索引 + 混合检索 + 文件导入（DOCX/TXT，单文件 ≤ 20MB）+ 自动分块
+- **模型管理**：OpenAI 兼容协议接入 + Ollama 本地模型 + 模型切换
+- **工具集成**：通过 OpenAPI Schema 集成内部 API
+- **提示词编辑器**：变量插值、多模型对比调试
+- **发布方式**：Web App + RESTful API（SSE 流式输出）
+- **基础运维**：结构化日志、健康检查接口、Token 用量统计
+
+### 不做什么（V1 明确排除）
+
+- Chatflow（用 Workflow + 对话记忆节点替代）、Text Generator（用 Chatbot 替代）
+- 多模态能力（视觉理解、图像生成）
+- 插件市场（Marketplace）、MCP 协议、Agent 策略插件化
+- Notion / 网站爬取导入、外部知识库连接
+- 嵌入式组件、前端模板定制
+- A/B 测试、角色权限、多工作空间、订阅计费
+- 外部可观测性平台集成（LangSmith / Langfuse）
+
+### 技术栈
+
+| 层 | 选型 | 说明 |
+|---|---|---|
+| 前端 | React + TypeScript | React Flow 工作流编辑器，可参考 Dify 前端实现 |
+| 后端 | Python FastAPI | AI/LLM SDK 原生支持，流式输出简洁 |
+| 数据库 | MySQL 8.* | 关系数据存储（应用、对话、工作流、知识库元数据） |
+| 向量库 | ChromaDB | 文档 chunk 向量存储与检索，嵌入进程内运行，零额外运维 |
+| 缓存 | Redis | 应用配置、Embedding 结果、检索结果、LLM 响应缓存 |
+| 部署 | Docker + Kubernetes + Nginx | K8s 部署，Nginx Ingress 处理 SSE 长连接，hify-web 容器托管静态资源 |
+
+### 本地开发环境
+
+详细配置请参考：[本地开发环境配置](docs/deployment/local-dev.md)
+
+**快速开始**：
+
+```bash
+# 1. 启动基础设施（MySQL + Redis）
+docker compose up -d
+
+# 2. 后端设置
+cd backend && pip install -r requirements.txt && alembic upgrade head
+uvicorn hify.main:app --reload
+
+# 3. 前端设置
+cd frontend && npm install && npm run dev
+```
+
+启动完成后：
+- 前端：http://localhost:5173
+- 后端 API：http://localhost:8000
+- API 文档：http://localhost:8000/docs
+
+### 部署架构
+
+#### 组件清单与请求流转
+
+```
+浏览器
+  │
+  │ https://hify.company.com
+  ▼
+Ingress Controller（集群已有）
+  │  SSE 配置：proxy-buffering off, proxy-read-timeout 300
+  ▼
+hify-web (Deployment, 1 replica)
+  │  Nginx 容器：React 静态资源 + /api/* 反代到 hify-api
+  │
+  │ /api/*
+  ▼
+hify-api (Deployment, 1 replica + PDB)
+  │  FastAPI 后端 + ChromaDB PersistentClient（进程内）
+  │  PVC 挂载 ChromaDB 向量数据
+  │
+  ├──→ MySQL (StatefulSet / 云托管) — 关系数据存储
+  ├──→ Redis (StatefulSet / 云托管) — 缓存 + SSE 连接注册
+  └──→ 外部 LLM API — OpenAI / GLM / DeepSeek / Ollama
+```
+
+**hify-api 用 1 副本的原因**：ChromaDB PersistentClient 是文件锁模式，多副本不能共享 PVC 写入。V2 迁移到 ChromaDB Server 或 Milvus 后再扩副本。
+
+#### 各组件职责
+
+| 组件 | 形态 | 副本 | 职责 | 资源 |
+|---|---|---|---|---|
+| Ingress Controller | 集群已有 | - | TLS 终结、域名路由、SSE 超时配置 | - |
+| hify-web | Deployment | 1 | React 静态资源、前端路由、`/api/*` 反代 | 0.2 CPU / 256Mi |
+| hify-api | Deployment | 1 | FastAPI 后端 + ChromaDB 进程内 | 1 CPU / 2Gi |
+| MySQL | StatefulSet 或云托管 | 1 | 关系数据存储 | 1 CPU / 2Gi |
+| Redis | StatefulSet 或云托管 | 1 | 缓存 + SSE 连接注册 | 0.5 CPU / 512Mi |
+
+持久化卷：`chroma-data` PVC（10Gi）挂载到 hify-api，`mysql-data` PVC（20Gi）挂载到 MySQL。
+
+#### 关键配置
+
+详细 K8s 配置（Ingress、Deployment、Nginx）请参考：[Kubernetes 部署配置](docs/deployment/kubernetes.md)
+
+**关键点**：
+- **Recreate 策略**：ChromaDB PersistentClient 用文件锁，RollingUpdate 会导致新旧 Pod 竞争同一 PVC
+- **SSE 超时**：Ingress + Nginx 两层均设置 `proxy_read_timeout: 300s`
+- **资源限制**：hify-api 1 CPU / 2Gi（请求）→ 2 CPU / 4Gi（限制）
+
+#### 运维预期
+
+- **瓶颈**：核心瓶颈是 LLM API 延迟（5-30 秒）和 Provider 并发限制
+- **SSE 保障**：Ingress + hify-web 两层关闭 proxy_buffering，Python 层 15 秒 keepalive
+- **LLM 容错**：429 限流排队重试、多 Key 轮询、Fallback 降级模型（详见 [LLM 调用规范](docs/backend/llm-integration.md)）
+- **监控**：/health 健康检查 + /metrics Prometheus 指标 + 结构化 JSON 日志（含 trace_id）
+
+#### 监控指标与告警
+
+详细监控指标和告警规则请参考：[Kubernetes 部署配置 - 监控指标与告警](docs/deployment/kubernetes.md#监控指标与告警)
+
+**关键告警阈值**：
+- ChromaDB 检索 p95 > 2s → CRITICAL
+- 总 chunk 数 > 25000 → WARN（一期容量上限）
+- 进程内存 > 3.5Gi → CRITICAL（即将 OOM）
+
+### 前端架构
+
+详细内容请参考：
+- [前端架构总览](docs/frontend/architecture.md)
+- [API 调用约定](docs/frontend/api-conventions.md)
+- [状态管理（Zustand）](docs/frontend/state-management.md)
+- [路由设计](docs/frontend/routing.md)
+
+**技术选型**：
+
+| 库 | 用途 |
+|---|---|
+| React 18 | UI 框架 |
+| TypeScript | 类型安全（strict 模式） |
+| React Flow | 工作流可视化编辑器 |
+| Zustand | 状态管理（轻量） |
+| TanStack Query | 服务端状态管理 |
+| Ant Design | UI 组件库 |
+| Vite | 构建工具 |
+
+**目录结构**：按功能分目录（pages/、components/、hooks/、services/、stores/、types/）
+    (body: Record<string, unknown>, onToken: (token: string) => void, onDone: () => void) => {
+      // 中断已有连接
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+        .then((response) => {
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder();
+          const pump = (): Promise<void> =>
+            reader.read().then(({ done, value }) => {
+              if (done) { onDone(); return; }
+              const text = decoder.decode(value);
+              // 解析 SSE 格式
+              for (const line of text.split("\n")) {
+                if (line.startsWith("data: ")) {
+                  const payload = line.slice(6);
+                  if (payload === "[DONE]") { onDone(); return; }
+                  onToken(JSON.parse(payload).content);
+                }
+              }
+              return pump();
+            });
+          return pump();
+        })
+        .catch((err) => {
+          if (err.name !== "AbortError") throw err;
+        });
+    },
+    [url],
+  );
+
+  const stop = useCallback(() => abortRef.current?.abort(), []);
+
+  return { start, stop };
+}
+```
+
+#### 组件命名规范
+
+| 类型 | 命名 | 示例 |
+|---|---|---|
+| 页面组件 | PascalCase，功能描述 | `ChatPage`、`WorkflowEditor` |
+| 通用组件 | PascalCase，组件功能 | `MarkdownRenderer`、`Pagination` |
+| 自定义 Hook | camelCase，use 前缀 | `useSSE`、`usePagination` |
+| 类型文件 | camelCase，与后端模块对齐 | `app.ts`、`chat.ts` |
+| API 服务 | camelCase，与后端模块对齐 | `services/app.ts` |
+
+#### 路由设计
+
+**URL 路径规范**：RESTful 风格，资源名用复数、小写、连字符分隔。
+
+```
+/                           → 首页（应用列表）
+/apps                       → 应用列表（同首页）
+/apps/new                   → 创建应用
+/apps/:id                   → 应用详情（Chatbot / Agent 配置页）
+/apps/:id/edit              → 编辑应用
+/chat                       → 对话页面（带默认应用）
+/chat/:appId                → 指定应用的对话页
+/chat/:appId/:conversationId → 指定对话的历史页
+/knowledge                  → 知识库列表
+/knowledge/new              → 创建知识库
+/knowledge/:id              → 知识库详情（文档管理）
+/workflows                  → 工作流列表
+/workflows/new              → 创建工作流
+/workflows/:id              → 工作流编辑器
+/workflows/:id/run          → 工作流执行历史
+/settings                   → 系统设置（Provider、模型）
+/settings/providers         → Provider 管理
+/login                      → 登录页（V1 可选，V2 加权限）
+*                           → 404 页面
+```
+
+**路由配置示例**：
+
+```typescript
+// router/index.tsx
+import { createBrowserRouter } from "react-router-dom";
+import Layout from "@/components/Layout";
+import AppList from "@/pages/apps/AppList";
+import AppCreate from "@/pages/apps/AppCreate";
+import AppDetail from "@/pages/apps/AppDetail";
+import ChatPage from "@/pages/chat/ChatPage";
+import KnowledgeList from "@/pages/knowledge/KnowledgeList";
+import KnowledgeDetail from "@/pages/knowledge/KnowledgeDetail";
+import WorkflowEditor from "@/pages/workflow/WorkflowEditor";
+import Settings from "@/pages/settings/Settings";
+import NotFound from "@/pages/NotFound";
+
+export const router = createBrowserRouter([
+  {
+    path: "/",
+    element: <Layout />,
+    children: [
+      { index: true, element: <AppList /> },                    // 首页 = 应用列表
+      { path: "apps", element: <AppList /> },
+      { path: "apps/new", element: <AppCreate /> },
+      { path: "apps/:id", element: <AppDetail /> },
+      { path: "apps/:id/edit", element: <AppCreate /> },
+      { path: "chat", element: <ChatPage /> },
+      { path: "chat/:appId", element: <ChatPage /> },
+      { path: "chat/:appId/:conversationId", element: <ChatPage /> },
+      { path: "knowledge", element: <KnowledgeList /> },
+      { path: "knowledge/new", element: <KnowledgeDetail /> },  // 复用详情页
+      { path: "knowledge/:id", element: <KnowledgeDetail /> },
+      { path: "workflows", element: <WorkflowList /> },
+      { path: "workflows/new", element: <WorkflowEditor /> },
+      { path: "workflows/:id", element: <WorkflowEditor /> },
+      { path: "settings", element: <Settings /> },
+      { path: "*", element: <NotFound /> },
+    ],
+  },
+]);
+```
+
+**规则**：
+- 嵌套路由：`Layout` 组件包含侧边栏导航，子路由渲染在内容区
+- 复用页面：创建/编辑用同一个组件，通过路由参数区分（`/new` 无 ID，`/:id/edit` 有 ID）
+- 对话页面：支持可选参数（`appId` 和 `conversationId`），组件内用 `useParams()` 获取
+
+#### Zustand Store 设计
+
+**Store 划分原则**：按业务域分 store，每个 store 管理一类状态。服务端状态用 TanStack Query（不进 Zustand）。
+
+| Store | 管理状态 | 不管理状态 |
+|---|---|---|
+| `appStore.ts` | 当前选中的应用、应用列表（缓存）、创建/编辑表单 | 应用详情（用 `useQuery`） |
+| `chatStore.ts` | 消息列表（本地 optimistic update）、当前对话 ID、发送状态 | 消息历史（用 `useInfiniteQuery`） |
+| `workflowStore.ts` | 工作流编辑器状态（nodes、edges、选中节点）、表草稿 | 工作流列表（用 `useQuery`） |
+
+**appStore 示例**：
+
+```typescript
+// stores/appStore.ts
+import { create } from "zustand";
+import type { App } from "@/types/app";
+
+interface AppState {
+  // State
+  currentApp: App | null;
+  apps: App[];
+  isCreating: boolean;
+
+  // Actions
+  setCurrentApp: (app: App | null) => void;
+  setApps: (apps: App[]) => void;
+  setIsCreating: (isCreating: boolean) => void;
+  reset: () => void;
+}
+
+export const useAppStore = create<AppState>((set) => ({
+  currentApp: null,
+  apps: [],
+  isCreating: false,
+
+  setCurrentApp: (app) => set({ currentApp: app }),
+  setApps: (apps) => set({ apps }),
+  setIsCreating: (isCreating) => set({ isCreating }),
+  reset: () => set({ currentApp: null, apps: [], isCreating: false }),
+}));
+```
+
+**chatStore 示例**：
+
+```typescript
+// stores/chatStore.ts
+import { create } from "zustand";
+import type { Message } from "@/types/chat";
+
+interface ChatState {
+  // State
+  messages: Message[];
+  conversationId: string | null;
+  isSending: boolean;
+
+  // Actions
+  addMessage: (message: Message) => void;
+  updateMessage: (messageId: string, content: string) => void;
+  setConversationId: (id: string | null) => void;
+  setIsSending: (isSending: boolean) => void;
+  clearMessages: () => void;
+}
+
+export const useChatStore = create<ChatState>((set) => ({
+  messages: [],
+  conversationId: null,
+  isSending: false,
+
+  addMessage: (message) => set((state) => ({
+    messages: [...state.messages, message],
+  })),
+  updateMessage: (messageId, content) => set((state) => ({
+    messages: state.messages.map((msg) =>
+      msg.id === messageId ? { ...msg, content } : msg
+    ),
+  })),
+  setConversationId: (id) => set({ conversationId: id }),
+  setIsSending: (isSending) => set({ isSending }),
+  clearMessages: () => set({ messages: [], conversationId: null }),
+}));
+```
+
+**workflowStore 示例**：
+
+```typescript
+// stores/workflowStore.ts
+import { create } from "zustand";
+import type { Node, Edge } from "@xyflow/react";
+
+interface WorkflowState {
+  // State
+  nodes: Node[];
+  edges: Edge[];
+  selectedNodeId: string | null;
+  isDirty: boolean;  // 未保存标记
+
+  // Actions
+  setNodes: (nodes: Node[]) => void;
+  setEdges: (edges: Edge[]) => void;
+  onNodesChange: (changes: NodeChange[]) => void;
+  onEdgesChange: (changes: EdgeChange[]) => void;
+  selectNode: (nodeId: string | null) => void;
+  markDirty: () => void;
+  reset: () => void;
+}
+
+export const useWorkflowStore = create<WorkflowState>((set) => ({
+  nodes: [],
+  edges: [],
+  selectedNodeId: null,
+  isDirty: false,
+
+  setNodes: (nodes) => set({ nodes }),
+  setEdges: (edges) => set({ edges }),
+  onNodesChange: (changes) => set((state) => ({
+    nodes: applyNodeChanges(changes, state.nodes),
+    isDirty: true,
+  })),
+  onEdgesChange: (changes) => set((state) => ({
+    edges: applyEdgeChanges(changes, state.edges),
+    isDirty: true,
+  })),
+  selectNode: (nodeId) => set({ selectedNodeId: nodeId }),
+  markDirty: () => set({ isDirty: true }),
+  reset: () => set({ nodes: [], edges: [], selectedNodeId: null, isDirty: false }),
+}));
+```
+
+**规则**：
+- 服务端数据用 `useQuery` / `useInfiniteQuery`（自动缓存、重试、去重）
+- 客户端临时状态用 Zustand（表单草稿、UI 交互状态）
+- Store 不包含异步逻辑（用 `services/*.ts` + TanStack Query 的 `mutation`）
+
+#### 组件层级拆分标准
+
+**拆分原则**：按职责分层，避免单文件超过 300 行。
+
+```
+Page（页面）          ← 路由级组件，组合多个 Section
+  └─ Section（区块）  ← 功能区域（如"消息列表区"、"输入区"）
+       └─ Component  ← 可复用组件（如"消息气泡"、"按钮"）
+```
+
+**ChatPage 拆分示例**：
+
+```typescript
+// pages/chat/ChatPage.tsx（页面层，组合布局）
+export default function ChatPage() {
+  return (
+    <div className="chat-page">
+      <ChatHeader />
+      <div className="chat-body">
+        <MessageList />
+        <ChatInput />
+      </div>
+    </div>
+  );
+}
+
+// components/MessageList.tsx（区块层，消息渲染）
+export default function MessageList() {
+  const { messages } = useChatStore();
+  return (
+    <div className="message-list">
+      {messages.map((msg) => (
+        <MessageBubble key={msg.id} message={msg} />
+      ))}
+    </div>
+  );
+}
+
+// components/MessageBubble.tsx（组件层，单条消息）
+export default function MessageBubble({ message }: { message: Message }) {
+  return (
+    <div className={`message-bubble ${message.role}`}>
+      <MarkdownRenderer content={message.content} />
+    </div>
+  );
+}
+```
+
+**拆分检查清单**：
+
+| 条件 | 拆分为独立组件 |
+|---|---|
+| 文件超过 300 行 | ✅ |
+| 重复出现 2 次以上 | ✅ |
+| 有独立状态（useState / useStore） | ✅ |
+| 职责单一（如"按钮"、"卡片"） | ✅ |
+| 仅用于布局（如 `<div className="flex">`） | ❌ |
+
+**禁止拆分**：
+
+```typescript
+// ❌ 过度拆分：无状态、无复用、只有布局
+function ChatBodyWrapper({ children }: { children: ReactNode }) {
+  return <div className="chat-body">{children}</div>;
+}
+
+// ✅ 正确：直接在父组件写布局
+<div className="chat-body">{children}</div>
+```
+
+**组件 Props 约定**：
+
+| 类型 | 命名 | 示例 |
+|---|---|---|
+| 数据 | `{资源名}` | `message`、`app`、`workflow` |
+| 事件 | `on{动作}` | `onSubmit`、`onCancel`、`onMessageSend` |
+| 布尔 | `is{状态}` | `isLoading`、`isDisabled`、`isSelected` |
+| 渲染函数 | `render{部分}` | `renderHeader`、`renderFooter` |
+
+```typescript
+// ✅ 正确
+interface MessageBubbleProps {
+  message: Message;
+  isEditing?: boolean;
+  onEdit?: (id: string) => void;
+  renderActions?: (msg: Message) => ReactNode;
+}
+
+// ❌ 错误
+interface Props {
+  data: any;        // 类型不明
+  onClick: () => void;
+  children?: any;   // 应用 ReactNode
+}
+```
+
+#### React Flow 工作流编辑器
+
+```typescript
+// 自定义节点必须注册 nodeTypes
+const nodeTypes = {
+  llm: LLMNode,
+  knowledge: KnowledgeNode,
+  http: HTTPNode,
+  code: CodeNode,
+  condition: ConditionNode,
+  template: TemplateNode,
+  variable: VariableNode,
+};
+
+function WorkflowEditor() {
+  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+
+  return (
+    <ReactFlow nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}>
+      <Background />
+      <Controls />
+    </ReactFlow>
+  );
+}
+```
+
+**规则**：
+- 节点配置用 Zustand 管理，不通过 URL 参数
+- 保存工作流时将 nodes/edges 序列化为 JSON 发送到后端
+- 节点间数据通过 React Flow 的 `Handle` 组件传递
+
+#### 环境变量
+
+```bash
+# .env.example
+VITE_API_BASE_URL=              # API 基础路径（空字符串表示同源，生产环境由 Nginx 反代）
+VITE_SSE_TIMEOUT=300000         # SSE 连接超时（毫秒）
+```
+
+规则：
+- 前端环境变量必须以 `VITE_` 前缀（Vite 要求）
+- 不在前端代码中存放任何密钥（API Key、Token 等）
+- 所有前端环境变量通过 `import.meta.env.VITE_XXX` 访问
+
+## 行为指令
+
+### 写代码时
+- 每个功能用最简单直接的方式实现
+- 不引入不必要的设计模式，除非我明确要求
+- 不做过度抽象
+- 不引入技术栈以外的依赖，需要时先问我
+- 所有外部调用必须有超时设置
+- 配置项外化到 .env 文件，通过 Pydantic BaseSettings 读取，不硬编码
+  
+### 改代码时
+- 先理解相关模块的设计意图
+- 不要为了新功能破坏已有接口契约
+- 改完确保已有测试通过
+  
+### 不确定时
+- 架构选择给我 2-3 个方案对比，我来拍板
+- 规范没覆盖的情况，先问我，不要自己编规矩
+
+### 编码规范（20 条）
+
+#### 命名（5 条）
+
+**N1. 模块/包名：全小写 + 下划线，不超 3 个单词**
+
+```
+✅ model_provider / knowledge / chat
+❌ ModelProvider / model-provider / llmClient
+```
+
+**N2. 类名：PascalCase，异常类以 Error 结尾**
+
+```python
+✅ class ChatService / class LLMRateLimitError / class AppCreateRequest
+❌ class chat_service / class LLMRateLimit / class app_create_request
+```
+
+**N3. 函数/方法/变量：snake_case，布尔返回用 is_/has_/can_ 前缀**
+
+```python
+✅ async def create_conversation() / def is_active() / def has_permission()
+❌ async def createConversation() / def check_active() / def get_permission()
+```
+
+**N4. 常量：全大写 + 下划线，集中在模块顶部或 core/config.py**
+
+```python
+✅ MAX_RETRY_COUNT = 3 / DEFAULT_PAGE_SIZE = 20 / KEEPALIVE_INTERVAL = 15
+❌ maxRetryCount = 3 / DefaultPageSize = 20
+```
+
+**N5. 禁止单字母变量（循环计数器 i/j/k 除外）和 Python 关键字/内置名**
+
+```python
+✅ user_id / provider_name / chunk_index
+❌ id / list / dict / str / input / l / O / I
+```
+
+#### 异常处理（5 条）
+
+**E1. 禁止裸 except，必须指定异常类型**
+
+```python
+✅ except httpx.TimeoutError: / except ValueError:
+❌ except: / except Exception:  # 除非在最外层兜底且重新抛出
+```
+
+**E2. 禁止吞异常（except 后 pass 或只有 ...）**
+
+```python
+✅ except httpx.TimeoutError:
+    logger.warning("LLM timeout", provider=provider_name, model=model_name)
+    raise LLMTimeoutError(...) from e
+
+❌ except httpx.TimeoutError:
+    pass  # 吞掉了，调用方不知道出了错
+```
+
+**E3. 用 raise ... from e 保留异常链，不要丢原始堆栈**
+
+```python
+✅ except sqlalchemy.IntegrityError as e:
+    raise AppAlreadyExistsError(...) from e
+
+❌ except sqlalchemy.IntegrityError as e:
+    raise AppAlreadyExistsError(...)  # 原始堆栈断了
+```
+
+**E4. 不在 service 层抛 HTTPException（唯一例外：core/security.py 认证鉴权）**
+
+```python
+✅ raise ModelProviderNotFoundError(code=42401)  # 领域异常，由全局处理器转 HTTP
+❌ raise HTTPException(status_code=404, detail="Not found")  # 在 service 中
+```
+
+**E5. try 块只包真正可能抛异常的代码，不要包整段逻辑**
+
+```python
+✅ result = await llm_client.chat(messages)
+try:
+    parsed = json.loads(result)
+except json.JSONDecodeError:
+    logger.error("invalid llm response", raw=result)
+    raise LLMParseError(...)
+
+❌ try:
+    result = await llm_client.chat(messages)
+    parsed = json.loads(result)
+    chunks = self.retriever.search(parsed["query"])
+    # 3 行里有 3 种不同异常，catch 全混在一起
+except Exception:
+    pass
+```
+
+#### 日志（5 条）
+
+**L1. 用 structlog 或标准库 logging，JSON 格式输出，每条日志必须含 trace_id**
+
+```python
+# core/logging.py 配置后，业务代码直接用
+import logging
+logger = logging.getLogger(__name__)
+
+# 每条日志自动注入 trace_id（通过中间件/Filter）
+logger.info("conversation created", conversation_id=conv.id, user_id=user.id)
+```
+
+**L2. 日志级别严格区分**
+
+| 级别 | 用途 | 示例 |
+|---|---|---|
+| ERROR | 需要人工介入的故障 | 数据库连接断开、LLM 全部 Provider 不可用 |
+| WARNING | 异常但可自动恢复 | 单个 Provider 429 限流（已 Fallback）、请求超时后重试成功 |
+| INFO | 关键业务节点 | 创建应用、发起对话、文档导入完成、工作流执行完成 |
+| DEBUG | 开发调试用 | LLM 请求/响应内容、SQL 查询、中间变量 |
+
+**L3. 日志不用 f-string 拼消息，用结构化字段**
+
+```python
+✅ logger.info("chat completed", conversation_id=conv_id, tokens=token_count, duration_ms=elapsed)
+❌ logger.info(f"chat completed: conv={conv_id}, tokens={token_count}, time={elapsed}")
+```
+
+原因：结构化字段可被日志平台（ELK/Loki）直接索引查询，f-string 只是一个大字符串。
+
+**L4. 禁止在日志中打印敏感信息**
+
+```python
+✅ logger.info("provider configured", provider_id=p.id, name=p.name)
+❌ logger.info("provider configured", api_key=p.api_keys[0])  # 泄露 API Key
+❌ logger.debug("user login", password=body.password)          # 泄露密码
+```
+
+**L5. ERROR 日志必须含上下文字段（谁、什么操作、什么错误、影响范围）**
+
+```python
+✅ logger.error(
+    "llm request failed after all retries",
+    model_id=model.id, provider=provider.name,
+    error=str(e), fallback_used=bool(model.fallback_model_id),
+    user_id=user_id, conversation_id=conv_id,
+)
+
+❌ logger.error("request failed")  # 没有任何上下文，无法排查
+```
+
+#### 并发（5 条）
+
+**C1. 禁止在 async 函数中调用同步阻塞 I/O（requests、time.sleep、subprocess）**
+
+```python
+✅ await asyncio.sleep(1)  # 异步 sleep
+✅ await asyncio.to_thread(sync_function, args)  # 包进线程池
+❌ time.sleep(1)  # 阻塞整个事件循环
+❌ requests.get(url)  # 同步 HTTP，阻塞事件循环
+```
+
+**C2. 共享状态必须加锁或用 asyncio 原语，禁止裸 dict/flag 做并发控制**
+
+```python
+# SSE 连接管理 — 用 asyncio.Event 做通知
+✅ class SSEConnectionManager:
+    def __init__(self):
+        self._connections: dict[str, asyncio.Event] = {}
+        self._lock = asyncio.Lock()  # 保护 dict 写操作
+
+    async def register(self, user_id, conversation_id):
+        async with self._lock:
+            ...
+
+❌ # 无锁保护，并发 register 可能互相覆盖
+    self._connections[key] = stop_event
+```
+
+**C3. async 函数签名必须加 async，调用必须加 await，禁止漏写**
+
+```python
+✅ async def get_user(db, user_id):
+    return await db.get(User, user_id)
+
+❌ async def get_user(db, user_id):
+    return db.get(User, user_id)  # 返回 coroutine 对象而非结果，静默 bug
+```
+
+**C4. 后台任务用 asyncio.create_task，不要用裸协程（fire-and-forget 会丢异常）**
+
+```python
+✅ task = asyncio.create_task(self._index_document_async(doc_id))
+task.add_done_callback(self._handle_index_error)  # 捕获异常，避免静默失败
+
+❌ self._index_document_async(doc_id)  # 返回 coroutine 但没 await，不会执行
+❌ asyncio.create_task(self._index_document_async(doc_id))  # 没捕获异常，异常被吞
+```
+
+**C5. 依赖注入的资源（db session、httpx client）不要跨请求共享或存储为类变量**
+
+```python
+# ✅ 正确：每次请求创建新 service 实例
+async def create_app(body, db=Depends(get_db)):
+    service = AppService(db)  # db 是请求级别的 session
+
+# ❌ 错误：类变量共享 db session
+class AppService:
+    db: AsyncSession  # 类变量，多个请求共享同一个 session
+```
+
+### 测试规范
+
+#### 目录结构
+
+```
+hify/
+├── tests/
+│   ├── conftest.py              # 全局 fixtures（db session、httpx client、mock 工厂）
+│   ├── unit/                    # 单元测试（不依赖外部服务）
+│   │   ├── test_models.py       # ORM 模型默认值、约束
+│   │   └── {module}/            # 按模块组织
+│   │       ├── test_service.py  # service 层逻辑
+│   │       └── test_schemas.py  # Pydantic 校验
+│   ├── integration/             # 集成测试（需要 MySQL/Redis）
+│   │   ├── test_api.py          # API 端到端（TestClient + 真实 DB）
+│   │   └── test_workflow.py     # 工作流执行
+│   └── fixtures/                # 测试数据工厂
+│       ├── factories.py         # 工厂函数（create_app, create_conversation）
+│       └── seed_data.py         # 种子数据
+├── pytest.ini                   # pytest 配置
+└── .coveragerc                  # 覆盖率配置
+```
+
+#### pytest 配置
+
+```ini
+# pytest.ini
+[pytest]
+testpaths = tests
+asyncio_mode = auto
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = -v --tb=short -x
+```
+
+```ini
+# .coveragerc
+[run]
+source = hify
+omit =
+    tests/*
+    hify/main.py
+    hify/core/events.py
+
+[report]
+fail_under = 80
+show_missing = true
+```
+
+#### 核心 fixtures
+
+```python
+# tests/conftest.py
+import asyncio
+import pytest
+import pytest_asyncio
+from httpx import AsyncClient, ASGITransport
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+from hify.main import app
+from hify.core.database import Base, get_db
+
+# 测试用独立数据库，不碰开发库
+TEST_DSN = "mysql+aiomysql://root:password@localhost:3306/hify_test"
+
+@pytest.fixture(scope="session")
+def event_loop():
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest_asyncio.fixture(scope="session")
+async def engine():
+    engine = create_async_engine(TEST_DSN, echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+
+@pytest_asyncio.fixture
+async def db_session(engine):
+    async with async_sessionmaker(engine)() as session:
+        yield session
+        await session.rollback()  # 每个测试后回滚，保持干净
+
+@pytest_asyncio.fixture
+async def client(db_session):
+    async def override_get_db():
+        yield db_session
+    app.dependency_overrides[get_db] = override_get_db
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
+```
+
+#### Mock 约定
+
+**外部调用必须 mock，数据库用测试实例**：
+
+```python
+# ✅ 正确：mock LLM 调用，用测试数据库
+from unittest.mock import AsyncMock, patch
+
+async def test_chat_completion(client, db_session):
+    with patch("hify.model_provider.llm_client.LLMClient.chat") as mock_chat:
+        mock_chat.return_value = "Hello from test"
+        response = await client.post("/api/v1/chat/completions", json={...})
+        assert response.status_code == 200
+
+# ❌ 错误：mock 数据库（丢失 SQL 约束验证、事务行为）
+```
+
+**Mock 粒度**：
+
+| 层 | Mock 什么 | 不 Mock 什么 |
+|---|---|---|
+| Unit | LLM API、Redis、ChromaDB、外部 HTTP | 业务逻辑、Pydantic 校验 |
+| Integration | LLM API（用预录响应） | MySQL（用测试实例）、FastAPI 路由 |
+
+**测试命名**：
+
+```python
+# 格式：test_{方法名}_{场景}_{预期结果}
+async def test_create_app_with_valid_data_returns_201():
+    ...
+
+async def test_create_app_with_duplicate_name_raises_40002():
+    ...
+```
+
+#### 覆盖率目标
+
+| 层 | 目标 | 说明 |
+|---|---|---|
+| service.py | ≥ 90% | 核心业务逻辑 |
+| router.py | ≥ 80% | 路由调度 |
+| models.py / schemas.py | ≥ 70% | 默认值、校验规则 |
+| 整体 | ≥ 80% | CI 门禁 |
+
+#### 运行命令
+
+```bash
+# 全量测试
+pytest
+
+# 单模块
+pytest tests/unit/chat/
+
+# 带覆盖率
+pytest --cov=hify --cov-report=term-missing
+
+# 只跑集成测试
+pytest tests/integration/
+```
+
+## 项目架构
+
+### 代码组织：按业务域分包（Domain Modular）
+
+单体应用，按业务域组织代码，每个模块自包含路由/服务/模型/Schema。后续拆微服务时一个目录对应一个服务。
+
+```
+hify/
+├── main.py                     # FastAPI 入口，挂载各模块路由
+├── core/                       # 全局基础设施（不放业务逻辑）
+│   ├── config.py               #   配置管理
+│   ├── database.py             #   DB 连接池、Session 工厂
+│   ├── redis.py                #   Redis 连接
+│   ├── exceptions.py           #   全局异常基类 + 处理器
+│   ├── security.py             #   认证鉴权
+│   ├── events.py               #   应用生命周期（startup/shutdown）
+│   └── cache.py                #   缓存工具函数
+│
+├── model_provider/             # 模型提供商管理
+│   ├── router.py               #   路由
+│   ├── service.py              #   业务逻辑
+│   ├── models.py               #   ORM
+│   ├── schemas.py              #   Pydantic DTO
+│   ├── llm_client.py           #   LLM 调用封装（OpenAI 兼容协议）
+│   ├── key_pool.py             #   API Key 轮询池（多 Key 轮询 + 冷却）
+│   ├── retry.py                #   重试策略（指数退避 + Retry-After）
+│   └── exceptions.py           #   领域异常
+│
+├── agent/                      # Agent 配置与执行
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py
+│   ├── schemas.py
+│   ├── executor.py             #   Agent 执行引擎（ReAct / Function Calling）
+│   ├── strategy.py             #   推理策略抽象
+│   └── exceptions.py
+│
+├── chat/                       # 对话引擎（SSE 流式）
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py               #   Conversation, Message, MessageChunkRef
+│   ├── schemas.py
+│   ├── sse.py                  #   SSE 流式输出封装
+│   ├── context.py              #   对话上下文管理（记忆窗口）
+│   └── exceptions.py
+│
+├── knowledge/                  # 知识库 + RAG
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py               #   Knowledge, Document, Chunk
+│   ├── schemas.py
+│   ├── pipeline.py             #   文档导入 → 分块 → 索引
+│   ├── retriever.py            #   检索引擎（向量 + 关键词混合）
+│   ├── embedder.py             #   Embedding 调用封装
+│   └── exceptions.py
+│
+├── workflow/                   # 简版工作流引擎
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py               #   Workflow, Node, Edge, Execution
+│   ├── schemas.py
+│   ├── engine.py               #   DAG 执行引擎
+│   ├── nodes/                  #   节点实现
+│   │   ├── base.py             #     节点基类
+│   │   ├── llm.py              #     LLM 节点
+│   │   ├── knowledge.py        #     知识检索节点
+│   │   ├── http.py             #     HTTP 请求节点
+│   │   ├── code.py             #     代码执行节点
+│   │   ├── condition.py        #     条件分支节点
+│   │   ├── template.py         #     模板节点
+│   │   └── variable.py         #     变量赋值节点
+│   └── exceptions.py
+│
+├── tool/                       # 工具集成（OpenAPI Schema + HTTP 调用）
+│   ├── router.py
+│   ├── service.py
+│   ├── models.py
+│   ├── schemas.py
+│   ├── connector.py            #   工具连接器（HTTP 调用执行）
+│   ├── openapi_parser.py       #   OpenAPI Schema 解析 → 工具定义
+│   └── exceptions.py
+│
+└── shared/                     # 模块间共享（不放业务逻辑）
+    ├── types.py                #   公共类型定义
+    ├── schemas.py              #   统一响应格式（Result、PageResult、PageRequest）
+    ├── pagination.py           #   分页工具
+    ├── logging.py              #   trace_id 日志工具
+    └── metrics.py              #   Prometheus 指标注册与采集
+```
+
+### 模块间依赖规则
+
+```
+model_provider  ← 被所有模块依赖（LLM 调用、Embedding）
+chat           → model_provider, knowledge, agent
+agent          → model_provider, tool
+workflow        → model_provider, knowledge
+knowledge      → model_provider（Embedding）
+tool           → 不依赖其他业务模块
+```
+
+约束：模块间通过接口依赖注入，不直接 import 其他模块的 service 实现。V1 阶段如果某模块只有一个实现，允许直接 import 具体实现类，待出现第二个实现时再提取 Protocol 重构。
+
+### 代码组织规范
+
+#### 一、模块内部分层
+
+每个业务模块内部严格按以下 4 层组织，不可混用：
+
+```
+模块/
+├── router.py      # 路由层：HTTP 调度
+├── service.py     # 服务层：业务逻辑编排
+├── models.py      # 数据层：ORM 模型
+└── schemas.py     # 契约层：请求/响应 DTO
+```
+
+**router.py 职责与约束**：
+
+- 定义 FastAPI APIRouter，声明路径、方法、状态码
+- 调用 `Depends()` 注入 Schema 校验、认证、数据库 Session
+- 调用 `service.py` 中的方法处理请求
+- 不写任何业务逻辑、不写 if/else/for 循环、不直接操作数据库
+- 遵循下方的接口规范（路径、响应、分页、空值）
+
+##### 接口规范
+
+**路径设计**：
+
+RESTful 风格：`/api/v1/{资源复数名}`
+
+```
+GET    /api/v1/providers               # 列表（分页）
+POST   /api/v1/providers               # 创建
+GET    /api/v1/providers/{id}          # 详情
+PUT    /api/v1/providers/{id}          # 更新
+DELETE /api/v1/providers/{id}          # 删除
+POST   /api/v1/providers/{id}/test-connection  # 非 CRUD 操作用动词
+```
+
+规则：
+- 资源名用复数、小写、连字符分隔（`/api/v1/model-providers`）
+- CRUD 操作用标准 HTTP 方法，不在路径里写动词（`/create-app` ❌）
+- 非 CRUD 操作（测试连接、重新索引、执行工作流）用 `POST + 动词` 路径
+- 路径中的 `{id}` 为 BigInteger，不是 UUID
+
+**统一响应**：
+
+所有接口返回 `Result<T>` 格式：
+
+```python
+# shared/schemas.py
+class Result(BaseModel, Generic[T]):
+    code: int = 200
+    message: str = "success"
+    data: T | None = None
+
+class PageResult(BaseModel, Generic[T]):
+    code: int = 200
+    message: str = "success"
+    data: list[T] = Field(default_factory=list)  # 空时返回 []，不返回 null
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+```
+
+成功响应示例：
+
+```json
+{
+    "code": 200,
+    "message": "success",
+    "data": {"id": 1, "name": "GPT-4o", "type": "chatbot"}
+}
+```
+
+错误响应示例（由全局异常处理器统一生成）：
+
+```json
+{
+    "code": 42401,
+    "message": "Model provider not found",
+    "data": null
+}
+```
+
+**分页规范**：
+
+请求参数：
+
+```python
+class PageRequest(BaseModel):
+    page: int = Field(default=1, ge=1, description="页码，从 1 开始")
+    page_size: int = Field(default=20, ge=1, le=100, description="每页条数，最大 100")
+```
+
+响应：`Result[list[T]>` 替换为 `PageResult<T>`，包含 `list`、`total`、`page`、`page_size`。
+
+大表分页特殊规则（详见 4.3 策略 3）：
+- 第一页（`page=1`）返回 `total`
+- 翻页时用游标参数 `after` 代替 `page`，不重复查 `total`，改用 `has_more` 标记
+
+```python
+# router.py — 分页列表示例
+@router.get("/providers", response_model=PageResult[ProviderResponse])
+async def list_providers(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return await ProviderService(db).list(page, page_size)
+```
+
+**空值处理**：
+
+```python
+# 响应序列化时的空值规则（Pydantic model 配置）
+class ProviderResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str = ""           # 空字符串，不返回 null
+    api_keys: list[str] = []        # 空数组，不返回 null
+    status: str = "active"
+```
+
+硬规则：
+- 列表字段空时返回 `[]`，不返回 `null`
+- 字符串字段空时返回 `""`，不返回 `null`
+- 对象不存在时返回 `null`（`data: null`）
+- Pydantic Schema 中所有可空字段必须设 `default=""` 或 `default=[]`
+
+**错误码**：
+
+响应中的 `code` 字段为 5 位业务错误码，按模块段位分配（与 HTTP 状态码分离，HTTP 状态码仍由全局异常处理器控制）：
+
+| 段位 | 模块 | 示例 |
+|---|---|---|
+| 40000-40999 | 请求参数 / 业务逻辑 | 40001 参数校验失败、40002 资源不存在 |
+| 41000-41999 | 认证授权 | 41101 Token 无效、41102 权限不足 |
+| 42000-42999 | LLM / Provider | 42101 请求超时、42201 服务不可用、42901 限流 |
+| 43000-43999 | 工作流 | 43001 校验失败、43002 执行超时 |
+| 44000-44999 | 知识库 / RAG | 44001 文档解析失败、44002 索引异常 |
+| 45000-45999 | 工具调用 | 45001 工具不可用、45002 调用超时 |
+| 50000-50999 | 系统内部错误 | 50000 兜底未知错误 |
+
+每个模块在 `exceptions.py` 中定义自己的错误码，不同模块不会冲突。新增错误码时在所属段位内递增，不要跳号。
+
+```python
+# 合法：路由只做调度
+@router.post("/apps", response_model=AppResponse, status_code=201)
+async def create_app(
+    body: AppCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    app = await AppService(db).create(body, user.id)
+    return AppResponse(data=app)
+
+# 违规：路由里写了业务逻辑
+@router.post("/apps")
+async def create_app(body: AppCreateRequest, db=Depends(get_db)):
+    if body.type not in ["chatbot", "agent", "workflow"]:  # ❌ 业务判断
+        raise HTTPException(400)
+    existing = await db.execute(select(App).where(...))      # ❌ 直接操作 DB
+```
+
+**service.py 职责与约束**：
+
+- 编排业务逻辑：校验、状态转换、调用其他服务、写数据库
+- 通过构造函数接收依赖（db session、其他 service 的接口）
+- 返回 Pydantic Schema 或 ORM 模型实例
+- 可以调用同模块的 models.py（ORM 操作）和其他模块的接口
+- 不处理 HTTP 语义（不 raise HTTPException，改用领域异常）
+
+```python
+# 合法：服务层编排业务逻辑
+class AppService:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def create(self, body: AppCreateRequest, user_id: str) -> App:
+        # 业务校验
+        await self._validate_app_limit(user_id)
+        # 创建实体
+        app = App(name=body.name, type=body.type, owner_id=user_id)
+        self.db.add(app)
+        await self.db.flush()
+        return app
+
+# 违规：服务层抛 HTTP 异常
+async def create(self, body):
+    if body.type not in ALLOWED_TYPES:
+        raise HTTPException(400, "invalid type")  # ❌ 用领域异常
+```
+
+**models.py 职责与约束**：
+
+- 定义 SQLAlchemy ORM 模型（表名、列、索引、关系）
+- 定义数据库级别约束（唯一、非空、外键）
+- 不写业务逻辑方法，只放纯数据结构
+- 如果模型有默认值生成逻辑，用 `default=` / `server_default=` 声明
+
+```python
+# 合法：纯数据模型
+class App(Base):
+    __tablename__ = "apps"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+# 违规：模型里写了业务方法
+class App(Base):
+    ...
+    def can_publish(self):                      # ❌ 业务逻辑不属于 models
+        return self.status == "active"
+```
+
+**schemas.py 职责与约束**：
+
+- 定义 Pydantic BaseModel，用于请求体校验和响应序列化
+- 用 `ConfigDict(from_attributes=True)` 映射 ORM 模型
+- 用 `Field(...)` 声明字段约束（长度、范围、正则）
+- 命名约定：`{Entity}CreateRequest`、`{Entity}UpdateRequest`、`{Entity}Response`、`{Entity}ListResponse`
+
+```python
+# 合法
+class AppCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=256)
+    type: Literal["chatbot", "agent", "workflow"]
+    description: str | None = Field(default=None, max_length=1024)
+
+class AppResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    name: str
+    type: str
+    created_at: datetime
+```
+
+#### 二、异常处理规范
+
+**三层异常体系**：
+
+```
+core/exceptions.py
+├── HifyBaseException           # 基类，所有自定义异常的父类
+│   ├── code: int               # 业务错误码
+│   ├── message: str            # 用户可见消息
+│   └── detail: str | None      # 内部调试信息（不返回给用户）
+│
+├── {module}/exceptions.py      # 每个模块定义自己的领域异常
+│   ├── AppNotFoundError(HifyBaseException)
+│   ├── WorkflowValidationError(HifyBaseException)
+│   ├── LLMRateLimitError(HifyBaseException)
+│   └── ...
+│
+└── core/exceptions.py          # 全局异常处理器（注册到 FastAPI）
+    ├── handle_hify_exception()  # 统一捕获，返回标准格式
+    └── handle_unexpected()      # 兜底 500，记录日志
+```
+
+**规则**：
+
+- router.py / service.py 只抛 `HifyBaseException` 子类，不抛 `HTTPException`
+- 唯一可以使用 `HTTPException` 的地方是认证鉴权（`core/security.py`）
+- 全局异常处理器统一将领域异常转为 HTTP 响应
+
+**错误码分段规范**：
+
+```
+错误码段位分配（code 字段）：
+40000-40999   请求参数 / 业务逻辑错误
+41000-41999   认证授权错误
+42000-42999   LLM / Provider 相关错误
+43000-43999   工作流执行错误
+44000-44999   知识库 / RAG 相关错误
+45000-45999   工具调用相关错误
+50000-50999   系统内部错误（兜底）
+```
+
+每个模块在自己的段内定义错误码，不同模块不会冲突。
+
+```python
+# core/exceptions.py
+class HifyBaseException(Exception):
+    http_status: int = 500       # HTTP 状态码（3 位）
+    code: int = 50000            # 业务错误码（5 位，按段位分配）
+    message: str = "Internal error"
+    detail: str | None = None
+
+# model_provider/exceptions.py
+class ModelProviderNotFoundError(HifyBaseException):
+    http_status = 404
+    code = 42401
+    message = "Model provider not found"
+
+class LLMRateLimitError(HifyBaseException):
+    http_status = 429
+    code = 42901
+    message = "LLM rate limit exceeded"
+
+class LLMTimeoutError(HifyBaseException):
+    http_status = 408
+    code = 42101
+    message = "LLM request timeout"
+
+class LLMServiceUnavailableError(HifyBaseException):
+    http_status = 502
+    code = 42201
+    message = "LLM service unavailable"
+
+class LLMStreamInterruptedError(HifyBaseException):
+    http_status = 500
+    code = 42301
+    message = "LLM stream interrupted"
+
+# workflow/exceptions.py
+class WorkflowValidationError(HifyBaseException):
+    http_status = 400
+    code = 43001
+    message = "Workflow validation failed"
+
+# knowledge/exceptions.py
+class DocumentParsingError(HifyBaseException):
+    http_status = 400
+    code = 44001
+    message = "Failed to parse document"
+
+# 全局注册
+@app.exception_handler(HifyBaseException)
+async def handle_hify_exception(request, exc: HifyBaseException):
+    return JSONResponse(
+        status_code=exc.http_status,
+        content={"code": exc.code, "message": exc.message},
+    )
+```
+
+#### 三、跨模块调用规则
+
+**允许的调用方式（白名单）**：
+
+```
+调用方          被调用方               调用方式
+────────────────────────────────────────────────────────────
+service.py  →  同模块 models.py      直接 import + ORM 操作
+service.py  →  同模块 其他文件        直接 import（如 executor.py）
+service.py  →  其他模块 service.py   通过 FastAPI Depends() 注入接口
+router.py   →  同模块 service.py     直接实例化或 Depends()
+任何文件     →  core/                 直接 import
+任何文件     →  shared/               直接 import
+任何文件     →  其他模块 schemas.py   直接 import（DTO 是公共契约）
+```
+
+**禁止的调用方式（黑名单）**：
+
+```
+❌ service.py 直接 import 其他模块的 service.py 实现类
+❌ router.py 直接操作数据库（必须经过 service.py）
+❌ models.py import 任何非 core/ 或标准库的模块
+❌ 跨模块直接 import ORM 模型（用 app_id 等 ID 关联，不建跨模块外键）
+❌ 循环依赖：A 模块 import B 模块，B 模块又 import A 模块
+```
+
+**跨模块接口注入方式**：
+
+```python
+# V1 阶段：直接 import 具体实现类（每个模块只有一个实现，无需 Protocol）
+# chat/service.py
+from model_provider.llm_client import LLMClient
+from knowledge.retriever import Retriever
+from agent.executor import AgentExecutor
+
+class ChatService:
+    def __init__(self, db: AsyncSession, llm_client: LLMClient, retriever: Retriever, agent_executor: AgentExecutor):
+        self.db = db
+        self.llm_client = llm_client
+        self.retriever = retriever
+        self.agent_executor = agent_executor
+
+# V2 阶段（当某接口出现第二个实现时）：提取 Protocol 到 shared/types.py
+# from shared.types import LLMClientProtocol
+# class ChatService:
+#     def __init__(self, db: AsyncSession, llm_client: LLMClientProtocol, ...):
+```
+
+#### 四、数据库操作规范
+
+- 每个 service.py 通过构造函数接收 `AsyncSession`
+- 同一请求内的多个 DB 操作共用同一个 Session（FastAPI 依赖注入保证）
+- 事务由 `get_db` 依赖自动管理（请求成功 commit，异常 rollback），service 层只做 flush 不做 commit
+
+**事务管理模式**：
+
+跨模块调用分两种事务场景，调用方必须显式声明选择哪种：
+
+```python
+# get_db 依赖：自动管理 Session 生命周期（请求结束 commit，异常 rollback）
+# async def get_db():
+#     async with async_session_factory() as session:
+#         try:
+#             yield session
+#             await session.commit()
+#         except Exception:
+#             await session.rollback()
+#             raise
+
+# 场景 1：强一致性（共享事务） — 调用方将自己的 Session 传给被调用方
+class ChatService:
+    def __init__(self, db: AsyncSession, knowledge_service: KnowledgeService):
+        self.db = db
+        self.knowledge_service = knowledge_service
+
+    async def create_conversation_with_retrieval(self, ...):
+        # 整个操作在同一事务中，由 get_db 依赖统一 commit/rollback
+        conversation = Conversation(...)
+        self.db.add(conversation)
+        await self.db.flush()
+        # 把自己的 Session 传给 knowledge_service，共享事务
+        chunks = await self.knowledge_service.retrieve_with_session(
+            self.db, query, knowledge_id
+        )
+
+# 场景 2：最终一致性（独立事务） — 被调用方内部创建新 Session
+class WorkflowService:
+    def __init__(self, db: AsyncSession, knowledge_service: KnowledgeService):
+        self.db = db
+
+    async def run_workflow(self, ...):
+        execution = WorkflowExecution(...)
+        self.db.add(execution)
+        await self.db.flush()
+        await self.db.commit()  # 提前 commit：主事务结束，后续操作独立
+        # knowledge_service 内部开新事务，与上方已提交的事务无关
+        await self.knowledge_service.index_document(doc_id)
+
+# KnowledgeService 提供两种调用方式
+class KnowledgeService:
+    async def retrieve_with_session(self, db: AsyncSession, query, knowledge_id):
+        """强一致性：使用调用方传入的 Session"""
+        result = await db.execute(select(Chunk).where(...))
+        return result.scalars().all()
+
+    async def index_document(self, doc_id: str):
+        """最终一致性：内部创建独立 Session"""
+        async with async_session_factory() as db:
+            async with db.begin():
+                doc = await db.get(Document, doc_id)
+                chunks = self.pipeline.chunk(doc.content)
+                db.add_all(chunks)
+```
+
+**规则**：
+
+- 默认使用强一致性（共享 Session），只有明确的异步/后台任务使用最终一致性
+- 跨模块通过 ID 关联，不建跨模块外键
+
+**事务安全规则**：
+
+- **事务内禁止 RPC/HTTP 调用** — 外部调用（LLM API、工具调用）耗时不定，长事务锁住行影响并发。先完成 DB 操作并 commit，再调外部接口
+- **事务要尽量短** — 先在内存中准备好数据，再开事务一气呵成写入，不要在事务里做复杂计算
+- **禁止在循环中开事务** — 循环内每次 commit 产生大量小事务，刷 binlog 压力大。改为批量收集后一次 commit
+
+```python
+# ❌ 错误：事务内调 LLM API
+async def create_with_llm(self, ...):
+    async with self.db.begin():
+        app = App(...)
+        self.db.add(app)
+        await self.db.flush()
+        result = await llm_client.chat(messages)  # ❌ LLM 调用可能 30 秒，事务一直开着
+
+# ✅ 正确：先准备，再开事务，调外部在事务外
+async def create_with_llm(self, ...):
+    result = await llm_client.chat(messages)  # 先调外部
+    async with self.db.begin():
+        app = App(..., summary=result)
+        self.db.add(app)
+```
+
+```python
+# chat 创建对话时引用 knowledge_id，不做跨模块外键
+class Conversation(Base):
+    knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)  # 0 = 未关联，无 ForeignKey
+
+# chat/models.py — AI 回复引用的知识库片段（跨模块关联表）
+class MessageChunkRef(Base):
+    __tablename__ = "message_chunk_refs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("messages.id"), nullable=False, index=True)
+    chunk_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)           # 只存 ID，无 ForeignKey（跨模块）
+    knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)       # 冗余字段，方便按知识库统计引用
+    score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)                  # 相似度分 × 10000，存整数
+    content_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="")         # 引用时的原文快照
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+```
+
+**用途**：
+
+- 前端展示来源引用（用户可点击查看原文片段）
+- 评估知识库质量（统计哪些 chunk 被频繁引用、哪些从未命中）
+- 排查幻觉（AI 回复是否有知识库依据）
+- `content_snapshot` 快照引用时的原文，因为 chunk 可能被重新索引后内容变化
+
+**关系**：`messages` 1:N `message_chunk_refs`，`message_chunk_refs` 通过 `chunk_id` 关联 `chunks`（跨模块，不建外键）
+
+**向量存储方案**：
+
+V1 使用 ChromaDB 作为向量存储，嵌入 FastAPI 进程内运行（PersistentClient），不需要独立服务。MySQL 存储文档元数据和分块文本，ChromaDB 存储向量化后的 embedding 并负责检索。
+
+```python
+# knowledge/models.py — MySQL 只存元数据和文本，不存向量
+class Document(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    file_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 不存 embedding — 向量在 ChromaDB 中
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+```
+
+```python
+# knowledge/retriever.py — ChromaDB 检索
+# ChromaDB PersistentClient 是同步库，必须用 asyncio.to_thread 避免阻塞事件循环
+import asyncio
+import chromadb
+
+class Retriever:
+    MAX_TOP_K = 50  # 硬上限：单次检索最多返回 50 条
+
+    def __init__(self, chroma_path: str):
+        self._client = chromadb.PersistentClient(path=chroma_path)
+
+    def _get_collection(self, knowledge_id: str):
+        return self._client.get_or_create_collection(
+            name=f"knowledge_{knowledge_id}",
+            metadata={
+                "hnsw:space": "cosine",
+                "hnsw:M": 16,              # 每个节点的邻居数，越大召回越准但内存越高
+                "hnsw:construction_ef": 200, # 建索引时的搜索宽度，越大索引质量越高
+            },
+        )
+
+    async def add_chunks(self, knowledge_id: str, chunks: list[dict]):
+        """写入向量：chunk_id, content, embedding"""
+        collection = self._get_collection(knowledge_id)
+        await asyncio.to_thread(
+            collection.add,
+            ids=[c["id"] for c in chunks],
+            documents=[c["content"] for c in chunks],
+            embeddings=[c["embedding"] for c in chunks],
+        )
+
+    async def vector_search(self, query_embedding: list[float], knowledge_id: str, top_k: int):
+        """向量检索：返回相似 chunk 的 id 和距离"""
+        if top_k <= 0 or top_k > self.MAX_TOP_K:
+            raise ValueError(f"top_k must be 1-{self.MAX_TOP_K}, got {top_k}")
+        collection = self._get_collection(knowledge_id)
+        results = await asyncio.to_thread(
+            collection.query,
+            query_embeddings=[query_embedding],
+            n_results=top_k,              # 等价 LIMIT，禁止不加
+            include=["documents", "distances"],
+        )
+        return results
+
+    async def delete_chunks(self, knowledge_id: str, chunk_ids: list[str]):
+        """删除指定 chunk 的向量"""
+        collection = self._get_collection(knowledge_id)
+        await asyncio.to_thread(collection.delete, ids=chunk_ids)
+
+    async def delete_collection(self, knowledge_id: str):
+        """删除整个知识库的向量集合"""
+        await asyncio.to_thread(self._client.delete_collection, name=f"knowledge_{knowledge_id}")
+```
+
+```python
+# core/config.py — ChromaDB 配置
+class Settings(BaseSettings):
+    # MySQL
+    mysql_dsn: str = "mysql+aiomysql://root:password@localhost:3306/hify"
+    # ChromaDB
+    chroma_persist_dir: str = "./data/chroma"
+    # ...
+```
+
+**职责划分**：
+
+```
+MySQL（关系数据）          ChromaDB（向量数据）
+├── 知识库元信息            ├── chunk embedding 向量
+├── 文档元信息              ├── chunk id → document_id 映射
+├── 分块文本内容            └── 余弦相似度检索
+└── chunk ↔ document 关联
+```
+
+**备份策略**：MySQL 用 mysqldump；ChromaDB 数据目录（`./data/chroma`）纳入文件备份。两者需要保持一致（删知识库时同时删 MySQL 记录和 ChromaDB collection）。
+
+**向量查询硬规则**：
+
+1. **必须建 HNSW 索引**。一期数据量小感知不到差异，但数据量上来后没索引的暴力扫描会从毫秒级变成秒级。ChromaDB 默认启用 HNSW，通过 `metadata` 配置参数（见 retriever.py 中 `_get_collection`）。
+2. **检索时必须加 LIMIT（`n_results`）**。禁止不加 `n_results` 的向量查询 — 全量排序会拖垮数据库。`top_k` 参数必传且有硬上限（`MAX_TOP_K = 50`）。
+
+V2 扩展到几千人时，ChromaDB 可切换为 Client/Server 模式或迁移到 Milvus/Qdrant，接口层在 retriever.py 中抽象即可。
+
+##### 4.1 通用字段约定
+
+所有表必须遵守以下字段规范，AI 建表时逐条检查：
+
+**数据库全局配置**：
+
+```python
+# core/database.py — SQLAlchemy 引擎配置
+engine = create_async_engine(
+    dsn,
+    pool_size=10,          # 常驻连接数
+    max_overflow=20,       # 峰值可额外创建的连接数
+    pool_recycle=1800,     # 连接最长存活 30 分钟，防 MySQL 8 小时断连
+    pool_pre_ping=True,    # 每次取连接时检测可用性
+    echo=False,
+)
+```
+
+```sql
+-- MySQL 全局配置（my.cnf 或初始化脚本）
+-- 字符集：utf8mb4（支持 emoji 和 4 字节字符），不用 utf8
+-- 排序规则：utf8mb4_unicode_ci（不区分大小写，适合搜索）
+-- 存储引擎：InnoDB（事务、行锁、MVCC），不要用 MyISAM
+-- 所有建表语句自动继承：
+CREATE DATABASE hify DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+**表/列命名规范**：
+
+| 对象 | 规则 | 正确示例 | 错误示例 |
+|---|---|---|---|
+| 表名 | 全小写 + 下划线，复数名词，不加项目前缀 | `users` / `conversations` / `message_chunk_refs` | `User` / `hify_users` / `user` |
+| 列名 | 全小写 + 下划线，有业务含义 | `created_at` / `owner_id` / `prompt_tokens` | `createdAt` / `cid` / `pt` |
+| 关联表 | `{主表}_{从表}`，按主从顺序 | `agent_tool_bindings` | `tool_agent_map` |
+| 索引名 | `idx_{表名}_{列名}`（非主键） | `idx_message_conv_created` | `index1` |
+| 唯一索引 | `uq_{表名}_{列名}` | `uq_app_name_owner` | `unique_name` |
+
+**表设计上限**：
+
+| 规则 | 上限 | 原因 |
+|---|---|---|
+| 单表字段数 | ≤ 30 | 超过说明职责不单一，考虑拆表 |
+| 单行总长度 | ≤ 8KB | InnoDB 页 16KB，行跨页性能差；TEXT 列存溢出页不受此限 |
+| 每张表必须有 `__table_args__` 中的 `comment` | — | 一人开发也必须加，3 个月后自己看不懂 |
+
+```python
+class App(Base):
+    __tablename__ = "apps"
+    __table_args__ = (
+        # 索引...
+        {"comment": "应用表（Chatbot/Agent/Workflow 三种类型）"},
+    )
+```
+
+**硬规矩（不可违反）**：
+
+1. **主键用 BIGINT 自增，禁止 UUID** — UUID 随机性导致索引页分裂，写入性能差
+2. **禁止 NULL** — 业务空值用空字符串 `""` 或 `0` 代替，所有列 `nullable=False`
+3. **金额和 Token 用量用 BIGINT 存最小精度** — 如金额存分（12345 = 123.45 元），Token 存个位，不用 DECIMAL/FLOAT
+4. **枚举用 VARCHAR(32)** — 不用 MySQL ENUM（加值要 ALTER TABLE）
+
+**主键**：
+
+```python
+from sqlalchemy import BigInteger
+from sqlalchemy.orm import Mapped, mapped_column
+
+id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+```
+
+**ID 列（外键引用 / 跨模块关联）**：
+
+```python
+# 同模块内：BigInteger + ForeignKey + 索引
+app_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("apps.id"), nullable=False, index=True)
+
+# 跨模块：只存 ID，不建 ForeignKey，0 表示未关联
+knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+```
+
+**时间戳**：每张表必须有 `created_at`，可选 `updated_at`。
+
+```python
+created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+updated_at: Mapped[datetime] = mapped_column(
+    DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+)
+```
+
+规则：
+- 用 `server_default=func.now()` 让 MySQL 生成时间，不用 Python 端 `default=datetime.now`
+- 不用 `TIMESTAMP`（2038 年溢出），统一 `DATETIME`
+
+**状态/类型字段**：
+
+```python
+status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+type: Mapped[str] = mapped_column(String(32), nullable=False)
+```
+
+规则：
+- 用 `String(32)` 不用 MySQL ENUM（ENUM 增值要 ALTER TABLE，VARCHAR 只改代码）
+- 状态值用小写蛇形：`active` / `disabled` / `pending` / `completed` / `failed`
+
+**逻辑删除字段**：所有业务表必须有 `deleted` 字段，禁止物理删除。
+
+```python
+deleted: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)  # 0=正常, 1=已删除
+```
+
+规则：
+- 查询时必须带 `WHERE deleted = 0`，因此 `deleted` 必须参与复合索引（详见 4.2）
+- 删除操作改为 `UPDATE SET deleted = 1`，不执行 `DELETE`
+- 关联查询时被关联表也要加 `deleted = 0` 条件
+
+**名称/描述字段**：
+
+```python
+name: Mapped[str] = mapped_column(String(256), nullable=False)
+description: Mapped[str] = mapped_column(String(1024), nullable=False, default="")  # 空值用 ""，不用 NULL
+content: Mapped[str] = mapped_column(Text, nullable=False)
+```
+
+**金额 / Token 用量**：
+
+```python
+# 金额：存最小单位（分），BIGINT
+price_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)  # 12345 = 123.45 元
+
+# Token 用量：存个位，BIGINT
+prompt_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+completion_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+```
+
+**JSON 字段**：
+
+```python
+config: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # 空值用 {}，不用 NULL
+```
+
+规则：
+- JSON 列只存配置型数据，整体读写
+- 不在 JSON 列上 WHERE 过滤（需要过滤的字段拆成独立列）
+
+##### 4.2 索引设计原则
+
+**规则 1：每个 ForeignKey 列必须有索引**
+
+MySQL 不会自动给子表的外键列建索引。漏掉会导致外键检查时全表扫描。
+
+```python
+# 正确
+conversation_id: Mapped[int] = mapped_column(
+    BigInteger, ForeignKey("conversations.id"), nullable=False, index=True
+)
+
+# 错误 — 外键无索引
+conversation_id: Mapped[int] = mapped_column(
+    BigInteger, ForeignKey("conversations.id"), nullable=False
+)  # ❌
+```
+
+**规则 2：逻辑删除字段 deleted 必须进索引**
+
+几乎所有查询都带 `WHERE deleted = 0`，不把 `deleted` 加进索引等于索引白建。
+
+```python
+# ✅ 正确 — deleted 在索引中
+__table_args__ = (
+    Index("idx_agent_user", "user_id", "deleted"),
+)
+
+# ❌ 错误 — 不含 deleted，查询 WHERE user_id = ? AND deleted = 0 无法完全命中索引
+__table_args__ = (
+    Index("idx_agent_user", "user_id"),
+)
+```
+
+**规则 3：复合索引等值列在前，范围列在后**
+
+MySQL 索引的最左前缀原则：等值过滤（`=`）的列放前面，范围/排序列放后面。顺序错了索引利用率暴跌。
+
+```python
+# 查询模式：WHERE conversation_id = ? AND deleted = 0 ORDER BY created_at DESC
+# 索引：等值列在前（conversation_id, deleted），范围/排序列在后（created_at）
+__table_args__ = (
+    Index("idx_message_conv_created", "conversation_id", "deleted", "created_at"),
+)
+```
+
+**规则 4：一个表不超过 5 个索引（含主键）**
+
+索引加速查询但拖慢写入。50-500 人规模写入量不大，但原则要守住。
+
+建索引的判断标准：
+- WHERE 条件中高频出现的列 → 建索引
+- JOIN 关联列 → 建索引
+- ORDER BY / GROUP BY 列 → 如果前面的等值列已建复合索引，排序列可以包含在内
+- SELECT 只返回的列 → 不建索引
+
+**规则 5：跨模块引用的 ID 列按需建索引**
+
+```python
+# 如果有 "按 knowledge_id 查询 chunk" 的场景 → 建索引
+knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, index=True)
+
+# 如果只是存储关联，不存在按此列查询的场景 → 不建索引
+model_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+```
+
+**规则 6：用 Index 定义复合索引，不在单列重复建**
+
+```python
+# ❌ 错误：两个单列索引，查询只能用一个
+knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, index=True)
+status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+
+# ✅ 正确：一个复合索引覆盖两种查询
+knowledge_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+status: Mapped[str] = mapped_column(String(32), nullable=False)
+__table_args__ = (
+    Index("idx_knowledge_status", "knowledge_id", "status"),
+)
+```
+
+**规则 7：多对多关联表两个方向都要索引**
+
+关联表按 A_id 查和按 B_id 查都是高频操作，只建一个方向，另一个方向全表扫描。
+
+```python
+class AgentToolBinding(Base):
+    __tablename__ = "agent_tool_bindings"
+
+    agent_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("agent_configs.id"), nullable=False)
+    tool_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("tools.id"), nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("agent_id", "tool_id"),        # 主键覆盖 agent_id → tools 方向
+        Index("idx_tool_agent", "tool_id"),                  # 反向：按 tool_id 查 agents
+    )
+```
+
+**规则 8：唯一约束用 UNIQUE INDEX，不只在代码层校验**
+
+并发场景下代码校验有竞态问题，数据库约束是最后防线。
+
+```python
+# ✅ 正确 — 数据库层面保证唯一
+__table_args__ = (
+    UniqueConstraint("name", "owner_id", name="uq_app_name_owner"),
+)
+
+# ❌ 错误 — 只在 service.py 中 if exists 检查，并发时会插入重复数据
+```
+
+适用场景：
+- 同一用户下应用名唯一（app.name + app.owner_id）
+- Provider 名称全局唯一（model_provider.name）
+- 工具标识唯一（tool.tool_key）
+
+**规则 9：禁止在大文本字段建索引**
+
+`content`、`prompt`、`description` 等 TEXT 字段不能建索引。需要全文搜索的场景后续引入 ES。
+
+```python
+# ❌ 禁止
+Index("idx_content", "content")  # TEXT 字段不能建 B-Tree 索引
+
+# 如果需要搜索 → 方案：
+# 1. 短字符串（如 name）用普通索引 + LIKE 'prefix%'（只能前缀匹配）
+# 2. 全文搜索 → V2 引入 Elasticsearch
+```
+
+##### 4.3 大表预判与应对策略
+
+Hify 中会持续增长的数据表：
+
+| 表 | 增长速度（50 人/天） | 一年预估 | 最大表？ | 应对策略 |
+|---|---|---|---|---|
+| messages | 每次对话 2-N 条，~5000 行/天 | ~180 万行 | 是 | 索引覆盖 + 游标分页 + 预留归档 |
+| message_chunk_refs | 每条 AI 消息 1-N 条，~10000 行/天 | ~360 万行 | 是 | 索引覆盖 + 游标分页 |
+| chunks | 导入时批量，不持续增长 | 取决于文档量 | 可能 | 向量在 ChromaDB，MySQL 只存元数据 |
+| workflow_executions | ~500 行/天 | ~18 万行 | 否 | 无需特殊处理 |
+| tool_calls | ~1000 行/天（Agent 模式） | ~36 万行 | 否 | 无需特殊处理 |
+
+**messages 和 message_chunk_refs 是仅有的两张大表**，一期建好索引够用半年。
+
+**大表应对策略（messages 为例）**：
+
+**策略 1：索引覆盖热查询**
+
+```python
+class Message(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("conversations.id"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    model_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    deleted: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        # 热查询：WHERE conversation_id = ? AND deleted = 0 ORDER BY created_at
+        # 等值列在前（conversation_id, deleted），排序列在后（created_at）
+        Index("idx_message_conv_created", "conversation_id", "deleted", "created_at"),
+    )
+```
+
+**策略 2：游标分页，禁止 OFFSET 深分页**
+
+```sql
+-- ❌ 禁止：OFFSET 深分页，百万行时极慢
+SELECT * FROM message ORDER BY id DESC LIMIT 20 OFFSET 100000;
+
+-- ✅ 正确：游标分页，O(1) 不随页数增加变慢
+SELECT * FROM message
+WHERE conversation_id = ? AND id < #{last_id} AND deleted = 0
+ORDER BY id DESC
+LIMIT 20;
+```
+
+```python
+# service.py — 游标分页实现
+async def list_messages(self, conversation_id: int, after: int | None, limit: int = 50):
+    query = (
+        select(Message)
+        .where(Message.conversation_id == conversation_id, Message.deleted == 0)
+    )
+    if after:
+        query = query.where(Message.id < after)
+    query = query.order_by(Message.id.desc()).limit(limit)
+    return (await self.db.execute(query)).scalars().all()
+
+# schemas.py — 请求
+class MessageListRequest(BaseModel):
+    conversation_id: int
+    after: int | None = Field(default=None, description="上一页最后一条消息的 id")
+    limit: int = Field(default=50, le=200)
+```
+
+**策略 3：COUNT 查询单独处理，列表页只在第一页返回 total**
+
+```python
+# 列表页分页模式：
+# - 第一页（after is None）：查 total + 数据，返回 {"items": [...], "total": 1234, "has_more": true}
+# - 后续页（after 有值）：只查数据，不查 total，返回 {"items": [...], "has_more": true/false}
+async def list_messages_page(self, conversation_id: int, after: int | None, limit: int = 50):
+    query = select(Message).where(
+        Message.conversation_id == conversation_id, Message.deleted == 0
+    )
+    if after:
+        query = query.where(Message.id < after)
+
+    items = (await self.db.execute(
+        query.order_by(Message.id.desc()).limit(limit + 1)
+    )).scalars().all()
+
+    has_more = len(items) > limit
+    items = items[:limit]
+
+    total = None
+    if after is None:
+        # 仅第一页查 total
+        total = await self.db.scalar(
+            select(func.count(Message.id)).where(
+                Message.conversation_id == conversation_id, Message.deleted == 0
+            )
+        )
+    return {"items": items, "total": total, "has_more": has_more}
+```
+
+说明：
+- 第一页查 total 是因为前端需要显示"共 N 条"
+- 翻页时不重复查 total — total 基本不变，重复查是浪费
+- `limit + 1` 技巧判断 has_more，避免额外 COUNT 查询
+
+**策略 4：分区（V2 阶段，一期不需要）**
+
+当 messages 超过 500 万行时（约 3 年），按月分区：
+
+```sql
+-- V2 阶段执行，一期不建分区
+ALTER TABLE messages PARTITION BY RANGE (TO_DAYS(created_at)) (
+    PARTITION p202601 VALUES LESS THAN (TO_DAYS('2026-02-01')),
+    PARTITION p202602 VALUES LESS THAN (TO_DAYS('2026-03-01')),
+    PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+##### 4.4 JSON 字段使用规范
+
+Hify 的 JSON 字段使用场景：
+
+| 表 | JSON 字段 | 存什么 | 查询方式 |
+|---|---|---|---|
+| model_providers | api_keys | `["sk-xxx", "sk-yyy"]` | 整体读取，不按元素查 |
+| models | model_params | `{"temperature": 0.7, "max_tokens": 4096}` | 整体读取 |
+| apps | app_config | `{"knowledge_ids": [...], "prompt": "..."}` | 整体读取 |
+| workflow_nodes | node_config | `{"model_id": "...", "template": "..."}` | 整体读取 |
+
+**规则**：
+- JSON 列只存配置型数据，整体读写
+- 如果未来出现需要 `WHERE json_col->>'$.field' = ?` 的查询 → 将该字段拆成独立列
+- 不在 JSON 列上建索引（一期无此需求）
+
+##### 4.5 建表检查清单
+
+AI 新建一张表时，逐项检查：
+
+```
+── 命名 ──
+□ 表名全小写 + 下划线，复数名词（apps / conversations / message_chunk_refs）
+□ 列名全小写 + 下划线，有业务含义（created_at / owner_id），不用驼峰或缩写
+□ 索引名 idx_{表名}_{列名}，唯一索引名 uq_{表名}_{列名}
+
+── 全局配置 ──
+□ 字符集 utf8mb4 + 排序规则 utf8mb4_unicode_ci + 引擎 InnoDB
+
+── 字段 ──
+□ id 列是 BigInteger + autoincrement，不用 UUID
+□ 所有列 nullable=False，空值用 default="" 或 default=0
+□ 业务表有 deleted 字段（SmallInteger, nullable=False, default=0）
+□ 有 created_at（DateTime, server_default=func.now(), nullable=False）
+□ 需要更新追踪的表有 updated_at
+□ 金额和 Token 用量列用 BigInteger，存最小精度
+□ status/type 字段用 String(32)，不用 MySQL ENUM
+□ 单表字段数 ≤ 30
+
+── 索引 ──
+□ 同模块 ForeignKey 列有 index=True
+□ 跨模块引用列无 ForeignKey，用 BigInteger + default=0
+□ 复合索引含 deleted 字段（几乎所有查询都带 deleted = 0）
+□ 复合索引等值列在前、范围/排序列在后
+□ 多对多关联表两个方向都有索引
+□ 唯一约束用 UniqueConstraint，不只在代码层校验
+□ 禁止在 TEXT 字段建索引
+□ 复合索引不超过 3 列，总索引数 ≤ 5（含主键）
+
+── 其他 ──
+□ 表有 comment 说明用途
+□ 名称 256、描述 1024（default=""）、正文 Text
+□ JSON 列 default=dict，只存配置型数据
+```
+
+##### 4.6 数据库迁移规范（Alembic）
+
+使用 Alembic 管理 MySQL schema 版本控制。所有表结构变更必须通过迁移脚本执行，禁止手动 DDL。
+
+**目录结构**：
+
+```
+hify/
+├── alembic/
+│   ├── env.py                  # Alembic 环境配置（指向 core/database.py）
+│   ├── script.py.mako          # 迁移脚本模板
+│   └── versions/               # 迁移文件（按时间顺序）
+│       ├── 001_create_users.py
+│       ├── 002_create_apps.py
+│       └── 003_add_app_config.py
+├── alembic.ini                 # Alembic 主配置
+└── ...
+```
+
+**alembic.ini 关键配置**：
+
+```ini
+[alembic]
+script_location = alembic
+sqlalchemy.url = mysql+aiomysql://root:password@localhost:3306/hify
+
+[loggers]
+keys = root,sqlalchemy,alembic
+```
+
+**env.py 配置要点**：
+
+```python
+# alembic/env.py
+from logging.config import fileConfig
+from alembic import context
+from sqlalchemy import engine_from_config, pool
+
+# 导入所有 ORM 模型，确保 Base.metadata 包含所有表
+from hify.core.database import Base
+from hify.model_provider import models as provider_models  # noqa
+from hify.chat import models as chat_models                # noqa
+from hify.knowledge import models as knowledge_models      # noqa
+from hify.workflow import models as workflow_models         # noqa
+from hify.agent import models as agent_models               # noqa
+from hify.tool import models as tool_models                 # noqa
+
+config = context.config
+fileConfig(config.config_file_name)
+target_metadata = Base.metadata
+```
+
+**迁移文件命名约定**：
+
+```
+{序号}_{简短描述}.py
+
+示例：
+001_create_users.py
+002_create_model_providers.py
+003_create_apps.py
+004_create_conversations_and_messages.py
+005_create_knowledge_tables.py
+006_create_workflow_tables.py
+007_create_agent_and_tool_tables.py
+008_create_message_chunk_refs.py
+```
+
+规则：
+- 序号 3 位数字，从 001 开始递增
+- 描述用下划线分隔，简短说明本次迁移内容
+- 一个迁移文件只做一件事（加表、加列、改列、加索引），不要混合多种操作
+
+**迁移操作规范**：
+
+```python
+# ✅ 正确：显式写 upgrade 和 downgrade
+def upgrade() -> None:
+    op.create_table(
+        "apps",
+        sa.Column("id", sa.BigInteger(), autoincrement=True, nullable=False),
+        sa.Column("name", sa.String(256), nullable=False),
+        sa.Column("type", sa.String(32), nullable=False),
+        sa.Column("owner_id", sa.BigInteger(), sa.ForeignKey("users.id"), nullable=False),
+        sa.Column("status", sa.String(32), server_default="active", nullable=False),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        mysql_charset="utf8mb4",
+        mysql_engine="InnoDB",
+        comment="应用表",
+    )
+    op.create_index("idx_apps_owner", "apps", ["owner_id"])
+
+def downgrade() -> None:
+    op.drop_index("idx_apps_owner", table_name="apps")
+    op.drop_table("apps")
+
+# ❌ 错误：只写 upgrade 不写 downgrade
+# ❌ 错误：用 autogenerate 后不加审查直接提交
+```
+
+**禁止事项**：
+
+- 禁止 `op.alter_column` 修改列类型或删除列时不提供 `downgrade`（生产环境可能需要回滚）
+- 禁止在迁移文件中 import 业务代码（service、schema），只依赖 `alembic.op` 和 `sqlalchemy`
+- 禁止同时修改 ORM 模型和运行迁移（先改模型 → 生成迁移 → 检查 → 运行迁移）
+
+**工作流**：
+
+```bash
+# 1. 修改 ORM 模型（models.py）
+# 2. 生成迁移脚本（自动对比模型与数据库差异）
+alembic revision --autogenerate -m "add app config column"
+
+# 3. 检查生成的迁移文件（必须！autogenerate 可能漏掉或多出变更）
+git diff alembic/versions/
+
+# 4. 执行迁移
+alembic upgrade head
+
+# 5. 回滚（如果出问题）
+alembic downgrade -1
+```
+
+**CI 检查**：
+
+CI 流水线中加入迁移一致性检查，确保 ORM 模型与迁移脚本同步：
+
+```bash
+# 生成临时迁移文件，如果没有输出说明模型和数据库一致
+alembic revision --autogenerate -m "check" --dry-run
+# 如果有输出 → 说明有人改了模型没生成迁移，CI 失败
+```
+
+##### 4.7 SQL 编写规范
+
+**查询规范**：
+
+| 规则 | 正确 | 错误 | 原因 |
+|---|---|---|---|
+| 禁止 `SELECT *` | `SELECT id, name, status` | `SELECT *` | 加字段影响覆盖索引、浪费带宽 |
+| `INSERT` 必须指定列名 | `INSERT INTO t(a, b) VALUES(?, ?)` | `INSERT INTO t VALUES(?, ?)` | 加字段会断 |
+| 禁止隐式类型转换 | `WHERE id = 123`（int 比 int） | `WHERE id = '123'`（str 比 int） | 索引失效 |
+| `IN` 列表 ≤ 500 个 | 分批查或用临时表 | `WHERE id IN (1,2,...,5000)` | 解析慢、占内存 |
+| `LIKE` 禁止左模糊 | `name LIKE 'gpt%'` | `name LIKE '%gpt%'` | 左模糊全表扫描 |
+| WHERE 禁止对列用函数 | `created_at >= '2026-01-01'` | `YEAR(created_at) = 2026` | 函数导致索引失效 |
+
+```python
+# SQLAlchemy 中的正确写法
+
+# ✅ 指定列（ORM 模式自动只查需要的列）
+query = select(App.id, App.name, App.status).where(App.deleted == 0)
+
+# ✅ IN 分批
+chunk_ids = [...]  # 可能有几千个
+results = []
+for i in range(0, len(chunk_ids), 500):
+    batch = chunk_ids[i:i+500]
+    rows = (await db.execute(select(Chunk).where(Chunk.id.in_(batch)))).scalars().all()
+    results.extend(rows)
+
+# ✅ 范围查询代替函数
+query = select(Message).where(
+    Message.created_at >= datetime(2026, 1, 1),
+    Message.created_at < datetime(2026, 2, 1),
+    Message.deleted == 0,
+)
+
+# ❌ 禁止隐式转换（id 是 BigInteger，不能传字符串）
+await db.get(App, "123")   # ❌ str 比 bigint
+await db.get(App, 123)     # ✅ int 比 bigint
+```
+
+**批量操作规范**：
+
+| 操作 | 规范 |
+|---|---|
+| 批量 INSERT | 单次 `add_all` 不超过 500 行，超过分批 |
+| 批量 UPDATE | 每批 500 行，用 `WHERE id IN (...)` 限定范围 |
+| 禁止循环单条写入 | `for item in items: db.add(item)` ❌；`db.add_all(items)` ✅ |
+| 大批量导入（文档分块） | 分批 500 行 `add_all` + 每批 `flush`，不要攒到几万行一次写 |
+
+```python
+# ✅ 正确：批量写入分批提交
+async def batch_insert_chunks(self, chunks: list[Chunk]):
+    for i in range(0, len(chunks), 500):
+        batch = chunks[i:i+500]
+        self.db.add_all(batch)
+        await self.db.flush()
+```
+
+**UPDATE/DELETE 安全规范**：
+
+- UPDATE/DELETE 必须带 WHERE 条件（代码中 SQLAlchemy 的 `update()` / `delete()` 不带 where 会全表操作）
+- UPDATE/DELETE 必须带 `deleted == 0` 条件（逻辑删除场景下只操作未删除的数据）
+
+```python
+# ✅ 正确：带 WHERE + deleted 条件
+await db.execute(
+    update(App).where(App.id == app_id, App.deleted == 0).values(status="disabled")
+)
+
+# ❌ 错误：不带 WHERE，全表更新
+await db.execute(update(App).values(status="disabled"))
+```
+
+#### 五、SSE 连接管理规范
+
+chat/sse.py 必须处理以下场景：
+
+**连接争用**：同一用户同一对话发起新请求时，服务端主动关闭旧 SSE 连接。
+
+```python
+# chat/sse.py
+class SSEConnectionManager:
+    """管理活跃的 SSE 连接，防止孤儿连接泄漏"""
+
+    def __init__(self):
+        self._connections: dict[str, asyncio.Event] = {}  # key: "{user_id}:{conversation_id}"
+
+    def register(self, user_id: str, conversation_id: str) -> asyncio.Event:
+        key = f"{user_id}:{conversation_id}"
+        # 如果已有连接，发送替换事件并关闭
+        if key in self._connections:
+            self._connections[key].set()  # 通知旧连接关闭
+        stop_event = asyncio.Event()
+        self._connections[key] = stop_event
+        return stop_event
+
+    def unregister(self, user_id: str, conversation_id: str):
+        key = f"{user_id}:{conversation_id}"
+        self._connections.pop(key, None)
+
+
+async def stream_response(request, conversation_id, user_id):
+    manager: SSEConnectionManager = request.app.state.sse_manager
+    stop_event = manager.register(user_id, conversation_id)
+
+    async def event_stream():
+        try:
+            async for token in llm_client.chat_stream(...):
+                if stop_event.is_set():
+                    yield {"event": "session_replaced", "data": "Connection replaced by new request"}
+                    return
+                yield {"event": "token", "data": json.dumps({"content": token})}
+            yield {"event": "done", "data": ""}
+        finally:
+            manager.unregister(user_id, conversation_id)
+
+    return EventSourceResponse(event_stream())
+```
+
+**保活机制**：LLM 思考时间可能超过 15 秒，用 `asyncio.wait_for` 在 token 间隔插入 SSE 注释帧（`: keepalive\n\n`），配合 Nginx `proxy_read_timeout 300s` 双重保障。
+
+```python
+KEEPALIVE_INTERVAL = 15  # 秒
+
+async def event_stream_with_keepalive(token_stream, stop_event):
+    """带保活的 SSE 事件生成器"""
+    aiter = token_stream.__aiter__()
+    while True:
+        try:
+            token = await asyncio.wait_for(aiter.__anext__(), timeout=KEEPALIVE_INTERVAL)
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            # SSE 注释帧：冒号开头，浏览器 EventSource API 忽略，但重置 Nginx 超时计时器
+            yield ": keepalive\n\n"
+            continue
+        if stop_event.is_set():
+            yield {"event": "session_replaced", "data": ""}
+            return
+        yield {"event": "token", "data": json.dumps({"content": token})}
+    yield {"event": "done", "data": ""}
+```
+
+#### 六、LLM 调用层规范
+
+model_provider 模块负责与外部 LLM API 交互。所有 Provider 走 OpenAI 兼容协议（`/v1/chat/completions`），用 `httpx.AsyncClient` 统一调用。从四个维度管理：线程管理、超时、重试、容错降级。
+
+##### 1. 线程管理 — 全 async，零阻塞
+
+全程 async，不使用线程池。`httpx.AsyncClient` 原生支持 async HTTP + SSE 流式，无阻塞点。
+
+```
+请求链路（全 async）：
+user → FastAPI route → ChatService → LLMClient.chat_stream()
+                                                    ↓
+                                          httpx.AsyncClient.stream("POST", ...)
+                                                    ↓
+                                          async for line in response.aiter_lines()
+                                                    ↓
+                                          yield token → SSE → 浏览器
+```
+
+`httpx.AsyncClient` 全局单例，在 `core/events.py` 的 shutdown 中 `await client.aclose()`：
+
+```python
+# model_provider/llm_client.py
+import httpx
+
+_http_client: httpx.AsyncClient | None = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=30.0),
+            limits=httpx.Limits(
+                max_connections=100,
+                max_connections_per_host=20,
+            ),
+        )
+    return _http_client
+```
+
+##### 2. 超时分级
+
+按场景分三级，`httpx.Timeout` 作为参数传入，不写死：
+
+| 场景 | connect | read | 说明 |
+|---|---|---|---|
+| 流式对话（SSE） | 10s | 300s | LLM 思考可能很长，连接建立要快 |
+| 非流式（Embedding / 工具调用） | 10s | 60s | 单次请求，不需要等太久 |
+| 健康检查（Provider 连通性） | 5s | 10s | 快速失败 |
+
+```python
+class LLMClient:
+    STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=30.0)
+    DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=30.0)
+    HEALTH_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+
+    async def chat(self, messages, model, stream=False, timeout=None):
+        client = await get_http_client()
+        actual_timeout = timeout or (self.STREAM_TIMEOUT if stream else self.DEFAULT_TIMEOUT)
+        ...
+```
+
+##### 3. 重试策略
+
+**重试决策矩阵**：
+
+| 错误类型 | 是否重试 | 策略 |
+|---|---|---|
+| 429 Rate Limit | 重试 | 指数退避 + 尊重 `Retry-After` 头 |
+| 500/502/503 服务端错误 | 重试 | 指数退避，最多 2 次 |
+| 连接超时 / 网络错误 | 重试 | 指数退避，最多 2 次 |
+| 401/403 认证失败 | 不重试 | Key 可能失效，立即失败 |
+| 400 请求格式错误 | 不重试 | 请求本身有问题，立即失败 |
+| 流式中途断开 | 不重试 | 已输出部分 token，无法重放 |
+
+```python
+# model_provider/retry.py
+import asyncio
+import random
+import httpx
+
+async def call_with_retry(
+    request_fn,           # async callable，执行实际请求
+    max_retries: int = 2,
+    base_delay: float = 1.0,
+):
+    """带指数退避的重试，用于非流式调用"""
+    for attempt in range(max_retries + 1):
+        try:
+            return await request_fn()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            # 不可重试 — 直接抛
+            if status in (400, 401, 403, 404):
+                raise
+            # 可重试 — 计算延迟
+            if status == 429:
+                retry_after = e.response.headers.get("retry-after")
+                delay = float(retry_after) if retry_after else base_delay * (2 ** attempt)
+            else:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+            if attempt < max_retries:
+                await asyncio.sleep(delay)
+            else:
+                raise
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError):
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                await asyncio.sleep(delay)
+            else:
+                raise
+```
+
+流式调用不做重试，失败直接走 Fallback 降级：
+
+```python
+async def chat_stream(self, messages, model, ...):
+    """流式调用 — 不重试，失败走 Fallback"""
+    async def _do_stream():
+        client = await get_http_client()
+        async with client.stream("POST", url, json=payload, timeout=self.STREAM_TIMEOUT) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                raise httpx.HTTPStatusError(...)
+            async for line in resp.aiter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    yield parse_token(line)
+    async for token in _do_stream():
+        yield token
+```
+
+##### 4. 容错降级
+
+三层容错，按优先级依次尝试：
+
+```
+请求失败
+  ↓
+Layer 1: Key 轮询（同 Provider 多 Key，429 时冷却当前 Key 切下一个）
+  ↓ 全部 Key 耗尽
+Layer 2: Fallback 模型（降级到更便宜/更稳定的模型）
+  ↓ 无 Fallback 或 Fallback 也失败
+Layer 3: 返回错误（LLMRateLimitError / LLMServiceUnavailableError）
+```
+
+**数据模型**：
+
+```python
+# model_provider/models.py
+class ModelProvider(Base):
+    __tablename__ = "model_providers"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)        # "openai", "deepseek", "ollama"
+    base_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    api_keys: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)  # {"keys": ["sk-xxx", "sk-yyy"]}
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+class Model(Base):
+    __tablename__ = "models"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    provider_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("model_providers.id"), nullable=False, index=True)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)  # "gpt-4o", "deepseek-chat"
+    fallback_model_id: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)  # 0 = 无降级
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+```
+
+**Key 轮询池**：
+
+```python
+# model_provider/key_pool.py
+import time
+
+class APIKeyPool:
+    """同 Provider 多 Key 轮询 + 冷却"""
+
+    def __init__(self, keys: list[str]):
+        self._keys = [k for k in keys if k]
+        self._index = 0
+        self._cooldown: dict[str, float] = {}  # key → 冷却截止时间
+
+    def next(self) -> str | None:
+        """取下一个可用 Key，跳过冷却中的"""
+        now = time.monotonic()
+        for _ in range(len(self._keys)):
+            key = self._keys[self._index % len(self._keys)]
+            self._index += 1
+            if key not in self._cooldown or self._cooldown[key] <= now:
+                return key
+        return None  # 全部在冷却中
+
+    def cool(self, key: str, seconds: float):
+        """将 Key 标记为冷却（429 时调用）"""
+        self._cooldown[key] = time.monotonic() + seconds
+```
+
+**完整调用流程**：
+
+```python
+# model_provider/llm_client.py
+class LLMClient:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def _resolve_request(self, model_id: str, messages: list, stream: bool):
+        """带完整容错的调用：Key 轮询 → 重试 → Fallback"""
+        model = await self.db.get(Model, model_id)
+        provider = await self.db.get(ModelProvider, model.provider_id)
+
+        key_pool = APIKeyPool(provider.api_keys)
+        key = key_pool.next()
+
+        if key is None:
+            # 所有 Key 都在冷却 → 直接 Fallback
+            return await self._try_fallback(model, messages, stream)
+
+        try:
+            if stream:
+                return self._stream_with_key(provider, key, model, messages)
+            else:
+                return await call_with_retry(
+                    lambda: self._call_with_key(provider, key, model, messages),
+                )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                retry_after = float(e.response.headers.get("retry-after", 30))
+                key_pool.cool(key, retry_after)
+                next_key = key_pool.next()
+                if next_key:
+                    if stream:
+                        return self._stream_with_key(provider, next_key, model, messages)
+                    else:
+                        return await call_with_retry(
+                            lambda k=next_key: self._call_with_key(provider, k, model, messages),
+                        )
+            return await self._try_fallback(model, messages, stream)
+
+    async def _try_fallback(self, model: Model, messages: list, stream: bool):
+        """降级到 fallback 模型，无 fallback 则抛异常"""
+        if model.fallback_model_id is None:
+            raise LLMRateLimitError(detail=f"No fallback for model {model.model_name}")
+        return await self._resolve_request(model.fallback_model_id, messages, stream)
+```
+
+**整体流程图**：
+
+```
+用户请求
+  │
+  ▼
+LLMClient.chat / chat_stream
+  │
+  ├─ 获取 Model 配置（含 fallback_model_id）
+  ├─ 获取 Provider 配置（含多 Key 列表）
+  │
+  ▼
+APIKeyPool.next() ──→ Key A
+  │                       │
+  │              httpx.AsyncClient 请求
+  │                       │
+  │         ┌──── 200 OK ────┤
+  │         │                │
+  │    流式: yield token   非流式: call_with_retry (最多 2 次)
+  │         │
+  │    ┌─ 429 ─── Key 冷却 → next Key ──→ 重试
+  │    │
+  │    ├─ 5xx ──→ call_with_retry 指数退避
+  │    │
+  │    ├─ 400/401/403 ──→ 直接抛异常
+  │    │
+  │    └─ 全部失败 ──→ _try_fallback
+  │                         │
+  │                   有 fallback ──→ 递归 _resolve_request
+  │                   无 fallback ──→ 抛 LLMRateLimitError
+```
+
+#### 七、新增功能的操作清单
+
+给模块新增一个功能时，按顺序改动以下文件：
+
+```
+1. {module}/models.py       — 新增/修改 ORM 模型
+2. {module}/schemas.py      — 新增请求/响应 Schema
+3. {module}/exceptions.py   — 新增领域异常（如需要）
+4. {module}/service.py      — 新增业务方法
+5. {module}/router.py       — 新增路由，调用 service 方法
+6. main.py                  — 无需改动（路由已挂载）
+```
+
+新增一个模块时：
+
+```
+1. 创建 {module}/ 目录
+2. 创建 models.py, schemas.py, exceptions.py, service.py, router.py
+3. 在 main.py 中挂载路由：app.include_router(module_router, prefix="/api/v1/{module}")
+4. V1 阶段：如需被其他模块调用，直接 export 具体实现类
+   V2 阶段：当同一接口出现第二个实现时，提取 Protocol 到 shared/types.py
+```
