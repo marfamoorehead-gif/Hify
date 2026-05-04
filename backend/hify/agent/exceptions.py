@@ -1,9 +1,9 @@
-from hify.core.exceptions import ErrorCode, HifyBaseException
+from hify.core.exceptions import BizException, ErrorCode
 
 
-class AgentNotFoundError(HifyBaseException):
+class AgentNotFoundError(BizException):
     def __init__(self, agent_id: int):
         super().__init__(
-            code=ErrorCode.RESOURCE_NOT_FOUND,
+            ErrorCode.RESOURCE_NOT_FOUND,
             message=f"Agent not found: {agent_id}",
         )

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from hify.core.events import lifespan
-from hify.core.exceptions import HifyBaseException, hify_exception_handler, unhandled_exception_handler
+from hify.core.exceptions import register_exception_handlers
 from hify.shared.schemas import Result
 
 from hify.model_provider.router import router as model_provider_router
@@ -24,13 +24,12 @@ app.add_middleware(
 )
 
 # 全局异常处理器
-app.add_exception_handler(HifyBaseException, hify_exception_handler)
-app.add_exception_handler(Exception, unhandled_exception_handler)
+register_exception_handlers(app)
 
 
 @app.get("/health")
 async def health():
-    return Result(data={"status": "healthy"})
+    return Result.ok(data={"status": "healthy"})
 
 
 # 挂载模块路由

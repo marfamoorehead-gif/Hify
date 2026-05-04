@@ -109,7 +109,18 @@ frontend/
 ## React Flow 工作流编辑器
 
 ```typescript
-// 自定义节点必须注册 nodeTypes
+// @xyflow/react v12 — 自定义节点必须注册 nodeTypes（定义在组件外避免重渲染）
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  type OnNodesChange,
+  type OnEdgesChange,
+  applyNodeChanges,
+  applyEdgeChanges,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+
 const nodeTypes = {
   llm: LLMNode,
   knowledge: KnowledgeNode,
@@ -121,11 +132,17 @@ const nodeTypes = {
 };
 
 function WorkflowEditor() {
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  // 节点和边状态由 Zustand workflowStore 管理（见 state-management.md）
+  const { nodes, edges, onNodesChange, onEdgesChange } = useWorkflowStore();
 
   return (
-    <ReactFlow nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}>
+    <ReactFlow
+      nodes={nodes}
+      edges={edges}
+      nodeTypes={nodeTypes}
+      onNodesChange={onNodesChange}
+      onEdgesChange={onEdgesChange}
+    >
       <Background />
       <Controls />
     </ReactFlow>
@@ -134,9 +151,11 @@ function WorkflowEditor() {
 ```
 
 **规则**：
-- 节点配置用 Zustand 管理，不通过 URL 参数
+- 节点和边状态统一由 Zustand `workflowStore` 管理，不在组件内用 useState
+- `nodeTypes` 对象定义在组件外部，避免每次渲染重新创建导致节点重挂载
 - 保存工作流时将 nodes/edges 序列化为 JSON 发送到后端
 - 节点间数据通过 React Flow 的 `Handle` 组件传递
+- 必须导入 `@xyflow/react/dist/style.css` 确保默认样式生效
 
 ---
 
@@ -152,6 +171,56 @@ VITE_SSE_TIMEOUT=300000         # SSE 连接超时（毫秒）
 - 前端环境变量必须以 `VITE_` 前缀（Vite 要求）
 - 不在前端代码中存放任何密钥（API Key、Token 等）
 - 所有前端环境变量通过 `import.meta.env.VITE_XXX` 访问
+
+---
+
+## Vite 配置
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+  server: {
+    port: 5173,
+    proxy: {
+      // 开发环境将 /api 请求代理到后端
+      "/api": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+    },
+  },
+  build: {
+    outDir: "dist",
+    sourcemap: false,
+    // 分包策略：第三方库单独打包
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom", "react-router-dom"],
+          antd: ["antd"],
+          xyflow: ["@xyflow/react"],
+        },
+      },
+    },
+  },
+});
+```
+
+**规则**：
+- 路径别名 `@/` 指向 `src/`，避免相对路径 `../../` 嵌套
+- 开发环境通过 proxy 将 `/api` 代理到后端，不配置 CORS
+- 生产构建使用分包策略，vendor/antd/xyflow 独立 chunk 减小主包体积
+- `tsconfig.json` 中需同步配置 `paths`：`"@/*": ["src/*"]`
 
 ---
 

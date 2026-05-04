@@ -90,6 +90,8 @@ export const useChatStore = create<ChatState>((set) => ({
 // stores/workflowStore.ts
 import { create } from "zustand";
 import type { Node, Edge } from "@xyflow/react";
+import { applyNodeChanges, applyEdgeChanges } from "@xyflow/react";
+import type { NodeChange, EdgeChange } from "@xyflow/react";
 
 interface WorkflowState {
   // State

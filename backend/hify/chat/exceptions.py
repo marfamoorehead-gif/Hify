@@ -1,9 +1,9 @@
-from hify.core.exceptions import ErrorCode, HifyBaseException
+from hify.core.exceptions import BizException, ErrorCode
 
 
-class ConversationNotFoundError(HifyBaseException):
+class ConversationNotFoundError(BizException):
     def __init__(self, conversation_id: int):
         super().__init__(
-            code=ErrorCode.RESOURCE_NOT_FOUND,
+            ErrorCode.RESOURCE_NOT_FOUND,
             message=f"Conversation not found: {conversation_id}",
         )

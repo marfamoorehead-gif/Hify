@@ -40,6 +40,7 @@ import AppDetail from "@/pages/apps/AppDetail";
 import ChatPage from "@/pages/chat/ChatPage";
 import KnowledgeList from "@/pages/knowledge/KnowledgeList";
 import KnowledgeDetail from "@/pages/knowledge/KnowledgeDetail";
+import WorkflowList from "@/pages/workflow/WorkflowList";
 import WorkflowEditor from "@/pages/workflow/WorkflowEditor";
 import Settings from "@/pages/settings/Settings";
 import NotFound from "@/pages/NotFound";

@@ -71,13 +71,15 @@ Chat 对话使用 SSE（Server-Sent Events）接收 LLM 流式输出，通过 `u
 
 ```typescript
 // hooks/useSSE.ts
-function useSSE(url: string, body: Record<string, unknown>) {
-  return {
-    data: string;            // 累积拼接的完整消息
-    isStreaming: boolean;    // 是否正在接收
-    error: Error | null;     // 连接错误
-    abort: () => void;       // 手动中止
-  };
+interface SSEResult {
+  data: string;            // 累积拼接的完整消息
+  isStreaming: boolean;    // 是否正在接收
+  error: Error | null;     // 连接错误
+  abort: () => void;       // 手动中止
+}
+
+function useSSE(url: string, body: Record<string, unknown>): SSEResult {
+  // 实现省略，规则见下方
 }
 ```
 

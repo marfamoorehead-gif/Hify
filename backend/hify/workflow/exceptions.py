@@ -1,22 +1,22 @@
-from hify.core.exceptions import ErrorCode, HifyBaseException
+from hify.core.exceptions import BizException, ErrorCode
 
 
-class WorkflowNotFoundError(HifyBaseException):
+class WorkflowNotFoundError(BizException):
     def __init__(self, workflow_id: int):
         super().__init__(
-            code=ErrorCode.WORKFLOW_NOT_FOUND,
+            ErrorCode.WORKFLOW_NOT_FOUND,
             message=f"Workflow not found: {workflow_id}",
         )
 
 
-class WorkflowExecutionError(HifyBaseException):
-    def __init__(self, detail: str = "Workflow execution failed"):
-        super().__init__(code=ErrorCode.WORKFLOW_EXECUTION_ERROR, message=detail)
+class WorkflowExecutionError(BizException):
+    def __init__(self, detail: str | None = None):
+        super().__init__(ErrorCode.WORKFLOW_EXECUTION_ERROR, message=detail)
 
 
-class WorkflowNodeError(HifyBaseException):
+class WorkflowNodeError(BizException):
     def __init__(self, node_type: str, detail: str = ""):
         super().__init__(
-            code=ErrorCode.WORKFLOW_NODE_ERROR,
+            ErrorCode.WORKFLOW_NODE_ERROR,
             message=f"Workflow node error [{node_type}]: {detail}",
         )

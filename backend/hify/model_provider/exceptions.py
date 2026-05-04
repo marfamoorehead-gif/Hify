@@ -1,24 +1,24 @@
-from hify.core.exceptions import ErrorCode, HifyBaseException
+from hify.core.exceptions import BizException, ErrorCode
 
 
-class ProviderNotFoundError(HifyBaseException):
+class ProviderNotFoundError(BizException):
     def __init__(self, provider_id: int):
         super().__init__(
-            code=ErrorCode.PROVIDER_NOT_FOUND,
+            ErrorCode.PROVIDER_NOT_FOUND,
             message=f"Model provider not found: {provider_id}",
         )
 
 
-class LLMRateLimitError(HifyBaseException):
-    def __init__(self, detail: str = "LLM rate limit exceeded"):
-        super().__init__(code=ErrorCode.LLM_RATE_LIMIT, message=detail)
+class LLMRateLimitError(BizException):
+    def __init__(self, detail: str | None = None):
+        super().__init__(ErrorCode.LLM_RATE_LIMIT, message=detail)
 
 
-class LLMServiceUnavailableError(HifyBaseException):
-    def __init__(self, detail: str = "LLM service unavailable"):
-        super().__init__(code=ErrorCode.LLM_SERVICE_UNAVAILABLE, message=detail)
+class LLMServiceUnavailableError(BizException):
+    def __init__(self, detail: str | None = None):
+        super().__init__(ErrorCode.LLM_SERVICE_UNAVAILABLE, message=detail)
 
 
-class LLMTimeoutError(HifyBaseException):
-    def __init__(self, detail: str = "LLM request timeout"):
-        super().__init__(code=ErrorCode.LLM_TIMEOUT, message=detail)
+class LLMTimeoutError(BizException):
+    def __init__(self, detail: str | None = None):
+        super().__init__(ErrorCode.LLM_TIMEOUT, message=detail)

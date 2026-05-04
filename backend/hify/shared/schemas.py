@@ -12,6 +12,14 @@ class Result(BaseModel, Generic[T]):
     message: str = "success"
     data: T | None = None
 
+    @classmethod
+    def ok(cls, data: T = None, message: str = "success") -> "Result[T]":
+        return cls(code=200, message=message, data=data)
+
+    @classmethod
+    def fail(cls, code: int, message: str) -> "Result[T]":
+        return cls(code=code, message=message, data=None)
+
 
 class PageResult(BaseModel, Generic[T]):
     """分页响应格式。"""

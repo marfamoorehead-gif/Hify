@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Server
     LOG_LEVEL: str = "DEBUG"
-    PORT: int = 8000
+    PORT: int = 8080
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
