@@ -11,7 +11,7 @@ import type { Result, PageResult } from "@/types/api";
 import type { App, AppCreateRequest } from "@/types/app";
 
 export async function getHealth(){
-  const { data } = await api.get<Result<App>>(`/health`);
+  const { data } = await api.get<Result<App>>(`/api/v1/health`);
    return data.data;
 }
 

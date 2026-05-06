@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 
+from hify.core.config import settings
 from hify.core.events import lifespan
 from hify.core.exceptions import register_exception_handlers
 from hify.shared.schemas import Result
@@ -27,15 +28,26 @@ app.add_middleware(
 register_exception_handlers(app)
 
 
+# K8s 探针用（不走版本前缀）
 @app.get("/health")
 async def health():
     return Result.ok(data={"status": "healthy"})
 
 
-# 挂载模块路由
-app.include_router(model_provider_router, prefix="/api/v1/model-providers")
-app.include_router(agent_router, prefix="/api/v1/agents")
-app.include_router(chat_router, prefix="/api/v1/chat")
-app.include_router(knowledge_router, prefix="/api/v1/knowledge")
-app.include_router(workflow_router, prefix="/api/v1/workflows")
-app.include_router(tool_router, prefix="/api/v1/tools")
+# 统一 API 路由
+api_router = APIRouter(prefix=settings.api_v1_prefix)
+
+
+@api_router.get("/health")
+async def api_health():
+    return Result.ok(data={"status": "healthy"})
+
+
+api_router.include_router(model_provider_router, prefix="/model-providers", tags=["Model Provider"])
+api_router.include_router(agent_router, prefix="/agents", tags=["Agent"])
+api_router.include_router(chat_router, prefix="/chat", tags=["Chat"])
+api_router.include_router(knowledge_router, prefix="/knowledge", tags=["Knowledge"])
+api_router.include_router(workflow_router, prefix="/workflows", tags=["Workflow"])
+api_router.include_router(tool_router, prefix="/tools", tags=["Tool"])
+
+app.include_router(api_router)
