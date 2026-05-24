@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from hify.core.config import settings
 from hify.core.events import lifespan
 from hify.core.exceptions import register_exception_handlers
+from hify.core.middleware import TraceIdMiddleware
 from hify.shared.schemas import Result
 
 from hify.model_provider.router import router as model_provider_router
@@ -12,6 +13,7 @@ from hify.chat.router import router as chat_router
 from hify.knowledge.router import router as knowledge_router
 from hify.workflow.router import router as workflow_router
 from hify.tool.router import router as tool_router
+from hify.auth.router import router as auth_router
 
 app = FastAPI(title="Hify", version="0.1.0", lifespan=lifespan)
 
@@ -23,6 +25,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Trace ID
+app.add_middleware(TraceIdMiddleware)
 
 # 全局异常处理器
 register_exception_handlers(app)
@@ -49,5 +54,6 @@ api_router.include_router(chat_router, prefix="/chat", tags=["Chat"])
 api_router.include_router(knowledge_router, prefix="/knowledge", tags=["Knowledge"])
 api_router.include_router(workflow_router, prefix="/workflows", tags=["Workflow"])
 api_router.include_router(tool_router, prefix="/tools", tags=["Tool"])
+api_router.include_router(auth_router)
 
 app.include_router(api_router)

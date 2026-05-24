@@ -9,12 +9,14 @@ from hify.core.config import settings
 from hify.core.database import Base
 
 # 导入所有 models 模块，确保表定义注册到 Base.metadata
+# TODO: models 定义后改为显式 import（如 from hify.chat.models import Conversation）
 from hify.model_provider.models import *  # noqa: F401, F403
 from hify.agent.models import *  # noqa: F401, F403
 from hify.chat.models import *  # noqa: F401, F403
 from hify.knowledge.models import *  # noqa: F401, F403
 from hify.workflow.models import *  # noqa: F401, F403
 from hify.tool.models import *  # noqa: F401, F403
+from hify.auth.models import *  # noqa: F401, F403
 
 config = context.config
 
